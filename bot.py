@@ -1353,7 +1353,7 @@ async def dmeveryone_command(ctx, *, message: str = None):
         print(f"Error in !dmeveryone: {e}")
 
 if __name__ == "__main__":
-    DISCORD_TOKEN = os.environ.get("MTQyNjYxNDM5Nzc0MDI1NzQyMQ.GICb_Y.VckiHcP2dcz_6DzM__X9RuMkVBDAY9jWQscQug")
+    DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
     if not DISCORD_TOKEN:
         print("❌ Error: DISCORD_TOKEN not found in environment variables.")
         exit(1)
