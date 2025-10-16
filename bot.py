@@ -1097,6 +1097,24 @@ async def listsupportroles(interaction: discord.Interaction):
     
     await interaction.response.send_message(embed=embed)
 
+@bot.tree.command(name="sync", description="Sync slash commands to this server (Admin only)")
+@app_commands.checks.has_permissions(administrator=True)
+async def sync(interaction: discord.Interaction):
+    try:
+        await interaction.response.defer(ephemeral=True)
+        
+        synced = await bot.tree.sync(guild=interaction.guild)
+        
+        embed = discord.Embed(
+            title="✅ Commands Synced",
+            description=f"Successfully synced {len(synced)} commands to this server!\n\nAll slash commands should now be visible immediately.",
+            color=discord.Color.green()
+        )
+        embed.set_footer(text=f"Synced by {interaction.user.display_name}")
+        await interaction.followup.send(embed=embed, ephemeral=True)
+    except Exception as e:
+        await interaction.followup.send(f"❌ Failed to sync commands: {e}", ephemeral=True)
+
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
 
 if not DISCORD_TOKEN:
