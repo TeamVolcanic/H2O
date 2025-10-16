@@ -55,6 +55,7 @@ SPAM_THRESHOLD = 5
 SPAM_COOLDOWN = 6
 SPAM_TIMEOUT_DURATION = datetime.timedelta(minutes=10)
 CURSING_TIMEOUT_DURATION = datetime.timedelta(minutes=5)
+TICKET_COOLDOWN_DURATION = 60
 MAX_DM_PER_WARN = 5
 DM_DELAY = 0.5
 MAX_EMBED_LENGTH = 4096
@@ -68,6 +69,7 @@ ticket_counter = {}
 active_tickets = {}
 ticket_claims = {}
 support_roles = {}
+ticket_cooldowns = {}
 
 BAD_WORDS_PATTERN = re.compile(
     r'(' + '|'.join(re.escape(word) for word in BAD_WORDS) + r')',
@@ -172,21 +174,35 @@ class TicketPanelView(discord.ui.View):
 
     @discord.ui.button(label="Create Ticket", style=discord.ButtonStyle.green, custom_id="create_ticket", emoji="🎫")
     async def create_ticket_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        
         guild = interaction.guild
         user = interaction.user
-        
+        user_id = user.id
         guild_id = guild.id
-        if guild_id not in ticket_counter:
-            ticket_counter[guild_id] = 0
+        current_time = datetime.datetime.now().timestamp()
+        
+        if user_id in ticket_cooldowns:
+            time_since_last = current_time - ticket_cooldowns[user_id]
+            if time_since_last < TICKET_COOLDOWN_DURATION:
+                remaining = int(TICKET_COOLDOWN_DURATION - time_since_last)
+                await interaction.followup.send(
+                    f"⏱️ Please wait {remaining} seconds before creating another ticket.",
+                    ephemeral=True
+                )
+                return
         
         for channel_id in active_tickets.get(guild_id, []):
             channel = guild.get_channel(channel_id)
             if channel and user.id in [m.id for m in channel.members]:
-                await interaction.response.send_message(
+                await interaction.followup.send(
                     f"❌ You already have an open ticket: {channel.mention}",
                     ephemeral=True
                 )
                 return
+        
+        if guild_id not in ticket_counter:
+            ticket_counter[guild_id] = 0
         
         ticket_counter[guild_id] += 1
         ticket_number = ticket_counter[guild_id]
@@ -197,7 +213,8 @@ class TicketPanelView(discord.ui.View):
             try:
                 category = await guild.create_category(TICKET_CATEGORY_NAME)
             except Exception as e:
-                await interaction.response.send_message(
+                ticket_counter[guild_id] -= 1
+                await interaction.followup.send(
                     f"❌ Failed to create ticket category: {e}",
                     ephemeral=True
                 )
@@ -247,6 +264,9 @@ class TicketPanelView(discord.ui.View):
             if guild_id not in active_tickets:
                 active_tickets[guild_id] = []
             active_tickets[guild_id].append(ticket_channel.id)
+            
+            ticket_cooldowns[user_id] = current_time
+            
             save_data()
             
             embed = discord.Embed(
@@ -274,13 +294,14 @@ class TicketPanelView(discord.ui.View):
             view = TicketControlsView()
             await ticket_channel.send(embed=embed, view=view)
             
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 f"✅ Ticket created: {ticket_channel.mention}",
                 ephemeral=True
             )
             
         except Exception as e:
-            await interaction.response.send_message(
+            ticket_counter[guild_id] -= 1
+            await interaction.followup.send(
                 f"❌ Failed to create ticket: {e}",
                 ephemeral=True
             )
@@ -676,8 +697,8 @@ async def ban(interaction: discord.Interaction, member: discord.Member, reason: 
     except Exception as e:
         await interaction.response.send_message(f"❌ Failed to ban member: {e}", ephemeral=True)
 
-@bot.tree.command(name="unban", description="Unban a user from the server (Admin only)")
-@app_commands.checks.has_permissions(administrator=True)
+@bot.tree.command(name="unban", description="Unban a user from the server")
+@app_commands.checks.has_permissions(ban_members=True)
 async def unban(interaction: discord.Interaction, user_id: str):
     try:
         user_id_int = int(user_id)
@@ -722,8 +743,8 @@ async def timeout(interaction: discord.Interaction, member: discord.Member, dura
     except Exception as e:
         await interaction.response.send_message(f"❌ Failed to timeout member: {e}", ephemeral=True)
 
-@bot.tree.command(name="untimeout", description="Remove timeout from a member (Admin only)")
-@app_commands.checks.has_permissions(administrator=True)
+@bot.tree.command(name="untimeout", description="Remove timeout from a member")
+@app_commands.checks.has_permissions(moderate_members=True)
 async def untimeout(interaction: discord.Interaction, member: discord.Member):
     try:
         if member.timed_out_until is None:
