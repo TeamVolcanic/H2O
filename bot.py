@@ -9,7 +9,12 @@ import json
 from collections import deque
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
-import google.generativeai as genai
+try:
+    import google.generativeai as genai
+    GENAI_AVAILABLE = True
+except ImportError:
+    genai = None
+    GENAI_AVAILABLE = False
 import io
 
 load_dotenv()
@@ -34,12 +39,16 @@ FEATURE_STATUS = {
 BAD_WORDS = [
     "fuck", "fucking", "fucked", "fucker", "fck", "f*ck",
     "shit", "shitty", "shitting", "bullshit", "horseshit",
-    "bitch", "bitching", "bastard", "asshole",
-    "ass", "arse", "arsehole","crappy","dick", "cock", "penis", "pussy",
+    "goddamn", "bitch", "bitching", "bastard", "asshole",
+    "ass", "arse", "arsehole", "crap", "crappy", "piss",
+    "pissed", "pissing", "dick", "cock", "penis", "pussy",
     "vagina", "cunt", "whore", "slut", "hoe", "prostitute",
     "nigger", "nigga", "negro", "n*gger", "n*gga",
-    "faggot", "f*ggot","terrorist", "rape", "raping", "rapist",
-    "kill yourself", "kys", "suicide","nazi", "hitler", "ahh", "slave", "slavery"
+    "fag", "faggot", "f*ggot", "dyke", "retard", "retarded",
+    "spastic", "coon", "chink", "gook", "wetback", "beaner",
+    "kike", "towelhead", "terrorist", "rape", "raping", "rapist",
+    "kill yourself", "kys", "suicide", "cancer", "aids",
+    "holocaust", "dork", "nazi", "hitler", "ahh", "slave", "slavery"
 ]
 
 SPAM_THRESHOLD = 5
@@ -83,7 +92,7 @@ OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-if GEMINI_API_KEY:
+if GEMINI_API_KEY and GENAI_AVAILABLE:
     genai.configure(api_key=GEMINI_API_KEY)
     gemini_client = True
 else:
@@ -482,7 +491,7 @@ async def _send_ai_response(interaction: discord.Interaction, prompt: str, ai_ty
                 await interaction.followup.send(embed=embed)
                 return
 
-    if not answer and gemini_client:
+    if not answer and gemini_client and GENAI_AVAILABLE:
         try:
             model = genai.GenerativeModel("gemini-pro")
             response = model.generate_content(prompt)
@@ -560,10 +569,10 @@ async def prompt_cmd(interaction: discord.Interaction, user_prompt: str):
 @bot.tree.command(name="imagegenerate", description="Generate an AI image using Gemini (Admin only)")
 @app_commands.checks.has_permissions(administrator=True)
 async def imagegenerate(interaction: discord.Interaction, prompt: str):
-    if not gemini_client:
+    if not gemini_client or not GENAI_AVAILABLE:
         embed = discord.Embed(
             title="❌ Configuration Error",
-            description="Gemini API key is not configured. Please contact the bot administrator.",
+            description="Gemini API is not available or configured. Please contact the bot administrator.",
             color=discord.Color.red()
         )
         await interaction.response.send_message(embed=embed, ephemeral=True)
