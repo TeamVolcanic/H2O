@@ -1,4 +1,5 @@
 import discord
+from discord import app_commands
 from discord.ext import commands
 import os
 import datetime
@@ -14,9 +15,11 @@ import io
 
 load_dotenv()
 
-BOT_PREFIX = "!"
 VERIFY_ROLE_NAME = "🧑︱Member"
 COMMANDS_DATA_FILE = "commands_data.json"
+TICKETS_DATA_FILE = "tickets_data.json"
+TICKET_CATEGORY_NAME = "Tickets"
+SUPPORT_ROLES_FILE = "support_roles.json"
 
 FEATURE_STATUS = {
     'info': True,
@@ -57,6 +60,10 @@ active_dm_tasks = {}
 user_warnings = {}
 user_dm_limits = {}
 prompt_messages = {}
+ticket_counter = {}
+active_tickets = {}
+ticket_claims = {}
+support_roles = {}
 
 BAD_WORDS_PATTERN = re.compile(
     r'(' + '|'.join(re.escape(word) for word in BAD_WORDS) + r')',
@@ -66,7 +73,16 @@ BAD_WORDS_PATTERN = re.compile(
 intents = discord.Intents.default()
 intents.members = True
 intents.message_content = True
-bot = commands.Bot(command_prefix=BOT_PREFIX, intents=intents)
+
+class MyBot(commands.Bot):
+    def __init__(self):
+        super().__init__(command_prefix="!", intents=intents)
+        
+    async def setup_hook(self):
+        await self.tree.sync()
+        print("Slash commands synced!")
+
+bot = MyBot()
 
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
@@ -75,7 +91,7 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
 def load_data():
-    global prompt_messages
+    global prompt_messages, ticket_counter, active_tickets, ticket_claims, support_roles
     try:
         with open(COMMANDS_DATA_FILE, 'r') as f:
             data = json.load(f)
@@ -84,6 +100,26 @@ def load_data():
         print("No command data file found. Starting fresh.")
     except Exception as e:
         print(f"Error loading command data: {e}")
+    
+    try:
+        with open(TICKETS_DATA_FILE, 'r') as f:
+            tickets_data = json.load(f)
+            ticket_counter = {int(k): v for k, v in tickets_data.get('counter', {}).items()}
+            active_tickets = {int(k): v for k, v in tickets_data.get('active', {}).items()}
+            ticket_claims = {int(k): v for k, v in tickets_data.get('claims', {}).items()}
+    except FileNotFoundError:
+        print("No tickets data file found. Starting fresh.")
+    except Exception as e:
+        print(f"Error loading tickets data: {e}")
+    
+    try:
+        with open(SUPPORT_ROLES_FILE, 'r') as f:
+            support_roles_data = json.load(f)
+            support_roles = {int(k): v for k, v in support_roles_data.items()}
+    except FileNotFoundError:
+        print("No support roles file found. Starting fresh.")
+    except Exception as e:
+        print(f"Error loading support roles: {e}")
 
 def save_data():
     try:
@@ -92,6 +128,231 @@ def save_data():
             json.dump(data_to_save, f, indent=4)
     except Exception as e:
         print(f"Error saving command data: {e}")
+    
+    try:
+        tickets_data = {
+            'counter': {str(k): v for k, v in ticket_counter.items()},
+            'active': {str(k): v for k, v in active_tickets.items()},
+            'claims': {str(k): v for k, v in ticket_claims.items()}
+        }
+        with open(TICKETS_DATA_FILE, 'w') as f:
+            json.dump(tickets_data, f, indent=4)
+    except Exception as e:
+        print(f"Error saving tickets data: {e}")
+    
+    try:
+        support_roles_data = {str(k): v for k, v in support_roles.items()}
+        with open(SUPPORT_ROLES_FILE, 'w') as f:
+            json.dump(support_roles_data, f, indent=4)
+    except Exception as e:
+        print(f"Error saving support roles: {e}")
+
+def can_manage_tickets(member: discord.Member, guild_id: int) -> bool:
+    if member.guild_permissions.administrator:
+        return True
+    
+    if guild_id in support_roles:
+        for role_id in support_roles[guild_id]:
+            if member.get_role(role_id):
+                return True
+    
+    return False
+
+class TicketPanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Create Ticket", style=discord.ButtonStyle.green, custom_id="create_ticket", emoji="🎫")
+    async def create_ticket_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        guild = interaction.guild
+        user = interaction.user
+        
+        guild_id = guild.id
+        if guild_id not in ticket_counter:
+            ticket_counter[guild_id] = 0
+        
+        for channel_id in active_tickets.get(guild_id, []):
+            channel = guild.get_channel(channel_id)
+            if channel and user.id in [m.id for m in channel.members]:
+                await interaction.response.send_message(
+                    f"❌ You already have an open ticket: {channel.mention}",
+                    ephemeral=True
+                )
+                return
+        
+        ticket_counter[guild_id] += 1
+        ticket_number = ticket_counter[guild_id]
+        ticket_name = f"ticket-{ticket_number:04d}"
+        
+        category = discord.utils.get(guild.categories, name=TICKET_CATEGORY_NAME)
+        if not category:
+            try:
+                category = await guild.create_category(TICKET_CATEGORY_NAME)
+            except Exception as e:
+                await interaction.response.send_message(
+                    f"❌ Failed to create ticket category: {e}",
+                    ephemeral=True
+                )
+                return
+        
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(read_messages=False),
+            user: discord.PermissionOverwrite(
+                read_messages=True,
+                send_messages=True,
+                attach_files=True,
+                embed_links=True
+            ),
+            guild.me: discord.PermissionOverwrite(
+                read_messages=True,
+                send_messages=True,
+                manage_channels=True
+            )
+        }
+        
+        for role in guild.roles:
+            if role.permissions.administrator:
+                overwrites[role] = discord.PermissionOverwrite(
+                    read_messages=True,
+                    send_messages=True,
+                    manage_messages=True
+                )
+        
+        if guild_id in support_roles:
+            for role_id in support_roles[guild_id]:
+                role = guild.get_role(role_id)
+                if role:
+                    overwrites[role] = discord.PermissionOverwrite(
+                        read_messages=True,
+                        send_messages=True,
+                        manage_messages=True
+                    )
+        
+        try:
+            ticket_channel = await guild.create_text_channel(
+                name=ticket_name,
+                category=category,
+                overwrites=overwrites,
+                topic=f"Ticket created by {user.display_name} ({user.id})"
+            )
+            
+            if guild_id not in active_tickets:
+                active_tickets[guild_id] = []
+            active_tickets[guild_id].append(ticket_channel.id)
+            save_data()
+            
+            embed = discord.Embed(
+                title="🎫 Ticket Created",
+                description=f"Welcome {user.mention}! Please describe your issue and a staff member will assist you shortly.",
+                color=discord.Color.green()
+            )
+            embed.add_field(
+                name="Ticket Number",
+                value=f"#{ticket_number:04d}",
+                inline=True
+            )
+            embed.add_field(
+                name="Created By",
+                value=user.mention,
+                inline=True
+            )
+            embed.add_field(
+                name="Status",
+                value="⏳ Unclaimed",
+                inline=True
+            )
+            embed.set_footer(text="Staff: Use the buttons below to manage this ticket")
+            
+            view = TicketControlsView()
+            await ticket_channel.send(embed=embed, view=view)
+            
+            await interaction.response.send_message(
+                f"✅ Ticket created: {ticket_channel.mention}",
+                ephemeral=True
+            )
+            
+        except Exception as e:
+            await interaction.response.send_message(
+                f"❌ Failed to create ticket: {e}",
+                ephemeral=True
+            )
+
+class TicketControlsView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Claim Ticket", style=discord.ButtonStyle.primary, custom_id="claim_ticket", emoji="✋")
+    async def claim_ticket_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        guild_id = interaction.guild.id
+        ticket_id = interaction.channel.id
+        
+        if not can_manage_tickets(interaction.user, guild_id):
+            await interaction.response.send_message(
+                "❌ You don't have permission to claim tickets.",
+                ephemeral=True
+            )
+            return
+        
+        if ticket_id in ticket_claims and ticket_claims[ticket_id]:
+            current_claimer = interaction.guild.get_member(ticket_claims[ticket_id])
+            if current_claimer:
+                await interaction.response.send_message(
+                    f"❌ This ticket is already claimed by {current_claimer.mention}",
+                    ephemeral=True
+                )
+                return
+        
+        ticket_claims[ticket_id] = interaction.user.id
+        save_data()
+        
+        embed = discord.Embed(
+            title="✅ Ticket Claimed",
+            description=f"{interaction.user.mention} is now handling this ticket.",
+            color=discord.Color.blue()
+        )
+        await interaction.response.send_message(embed=embed)
+        
+        async for msg in interaction.channel.history(limit=10):
+            if msg.embeds and "Ticket Created" in msg.embeds[0].title:
+                new_embed = msg.embeds[0]
+                for i, field in enumerate(new_embed.fields):
+                    if field.name == "Status":
+                        new_embed.set_field_at(i, name="Status", value=f"✅ Claimed by {interaction.user.mention}", inline=True)
+                await msg.edit(embed=new_embed)
+                break
+
+    @discord.ui.button(label="Close Ticket", style=discord.ButtonStyle.danger, custom_id="close_ticket", emoji="🔒")
+    async def close_ticket_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        guild_id = interaction.guild.id
+        
+        if not can_manage_tickets(interaction.user, guild_id):
+            await interaction.response.send_message(
+                "❌ You don't have permission to close tickets.",
+                ephemeral=True
+            )
+            return
+        
+        channel = interaction.channel
+        
+        if guild_id in active_tickets and channel.id in active_tickets[guild_id]:
+            embed = discord.Embed(
+                title="🔒 Closing Ticket",
+                description="This ticket will be deleted in 5 seconds...",
+                color=discord.Color.red()
+            )
+            embed.set_footer(text=f"Closed by {interaction.user.display_name}")
+            
+            await interaction.response.send_message(embed=embed)
+            
+            active_tickets[guild_id].remove(channel.id)
+            if channel.id in ticket_claims:
+                del ticket_claims[channel.id]
+            save_data()
+            
+            await asyncio.sleep(5)
+            await channel.delete(reason=f"Ticket closed by {interaction.user.display_name}")
+        else:
+            await interaction.response.send_message("❌ This is not an active ticket channel.", ephemeral=True)
 
 @bot.event
 async def on_ready():
@@ -103,44 +364,10 @@ async def on_ready():
         print("⚠️  Warning: OPENAI_API_KEY not found. AI commands will not work.")
     load_data()
     print("Command data loaded.")
-
-@bot.event
-async def on_command_error(ctx, error):
-    if hasattr(ctx.command, 'on_error'):
-        return
-
-    if isinstance(error, commands.CommandNotFound):
-        if ctx.message.content.startswith(BOT_PREFIX):
-            embed = discord.Embed(
-                title="❌ Unknown Command",
-                description=f"The command `{ctx.invoked_with}` is not a valid command. Please check your spelling or use `{BOT_PREFIX}help` for a list of available commands.",
-                color=discord.Color.red()
-            )
-            await ctx.send(embed=embed, delete_after=10)
-        return
-
-    elif isinstance(error, commands.MissingPermissions):
-        embed = discord.Embed(
-            title="❌ Permission Denied",
-            description=f"You need the following permission(s) to use this command: **{', '.join(error.missing_permissions)}**.",
-            color=discord.Color.red()
-        )
-        await ctx.send(embed=embed)
-    elif isinstance(error, commands.BadArgument) or isinstance(error, commands.MissingRequiredArgument):
-        embed = discord.Embed(
-            title="❌ Invalid Usage",
-            description=f"You used the command incorrectly. Please check the required arguments.",
-            color=discord.Color.red()
-        )
-        await ctx.send(embed=embed, delete_after=10)
-    else:
-        print(f"Unhandled error in command {ctx.command}: {error}")
-        error_embed = discord.Embed(
-            title="💥 An Unexpected Error Occurred",
-            description=f"Error: `{error}`",
-            color=discord.Color.red()
-        )
-        await ctx.send(embed=error_embed, delete_after=15)
+    
+    bot.add_view(TicketPanelView())
+    bot.add_view(TicketControlsView())
+    print("Ticket views registered.")
 
 @bot.event
 async def on_message(message):
@@ -213,321 +440,24 @@ async def on_message(message):
                 except Exception as e:
                     print(f"Error handling spam: {e}")
 
-    await bot.process_commands(message)
-
-@bot.group(invoke_without_command=True, aliases=['ai'])
-async def aicommand(ctx):
-    if ctx.invoked_subcommand is None:
-        usage_embed = discord.Embed(
-            title="🤖 AI Commands Group",
-            description="Use one of the following subcommands for AI interactions:",
-            color=discord.Color.blue()
-        )
-        usage_embed.add_field(name="`!ask <question>`", value="Get a simple, factual answer.", inline=False)
-        usage_embed.add_field(name="`!generate <prompt>`", value="Generate creative text (Admin only).", inline=False)
-        usage_embed.add_field(name="`!prompt <prompt>`", value="Get a structured AI response (Admin only).", inline=False)
-        usage_embed.add_field(name="`!aiedit <message_id> <new_prompt>`", value="Edit a previous AI response (Admin only).", inline=False)
-        await ctx.send(embed=usage_embed)
-
-def _check_ai_config(ctx):
+def _check_ai_config(interaction):
     if not openai_client and not gemini_client:
-        error_embed = discord.Embed(
+        return False
+    return True
+
+async def _send_ai_response(interaction: discord.Interaction, prompt: str, ai_type: str, max_tokens: int, temperature: float):
+    if not _check_ai_config(interaction):
+        embed = discord.Embed(
             title="❌ Configuration Error",
             description="Neither OpenAI nor Gemini API key is configured. Please contact the bot administrator.",
             color=discord.Color.red()
         )
-        asyncio.create_task(ctx.send(embed=error_embed))
-        return False
-    return True
-
-async def _send_and_store_ai_response(ctx, prompt, ai_type, max_tokens, temperature):
-    if not _check_ai_config(ctx):
+        await interaction.response.send_message(embed=embed, ephemeral=True)
         return
 
-    async with ctx.typing():
-        answer = None
-        ai_provider = None
-
-        if openai_client:
-            try:
-                response = await openai_client.chat.completions.create(
-                    model="gpt-4o-mini",
-                    messages=[
-                        {"role": "user", "content": prompt}
-                    ],
-                    max_tokens=max_tokens,
-                    temperature=temperature
-                )
-                answer = response.choices[0].message.content or "No response generated"
-                ai_provider = "OpenAI"
-            except Exception as e:
-                print(f"OpenAI API Error: {e}")
-                if gemini_client:
-                    print("Falling back to Gemini...")
-                else:
-                    error_embed = discord.Embed(
-                        title="❌ Error",
-                        description=f"Failed to generate response with OpenAI: {str(e)}",
-                        color=discord.Color.red()
-                    )
-                    await ctx.send(embed=error_embed)
-                    return
-
-        if not answer and gemini_client:
-            try:
-                response = gemini_client.models.generate_content(
-                    model="gemini-2.0-flash-exp",
-                    contents=[prompt]
-                )
-                answer = response.text or "No response generated"
-                ai_provider = "Gemini"
-            except Exception as e:
-                error_embed = discord.Embed(
-                    title="❌ Error",
-                    description=f"Failed to generate response with Gemini: {str(e)}",
-                    color=discord.Color.red()
-                )
-                await ctx.send(embed=error_embed)
-                print(f"Gemini API Error: {e}")
-                return
-
-        if not answer:
-            return
-
-        was_truncated = False
-        if len(answer) > MAX_EMBED_LENGTH - 100:
-            answer = answer[:MAX_EMBED_LENGTH - 103] + "..."
-            was_truncated = True
-
-        if ai_type == 'ask':
-            color = discord.Color.blue()
-        elif ai_type == 'generate':
-            color = discord.Color.purple()
-        elif ai_type == 'prompt':
-            color = discord.Color.green()
-        else:
-            color = discord.Color.default()
-
-        embed = discord.Embed(
-            description=answer,
-            color=color
-        )
-        embed.set_footer(text=f"Prompted by {ctx.author.display_name} • {ai_provider}")
-
-        if was_truncated:
-            embed.add_field(
-                name="⚠️ Note",
-                value="Response was truncated due to length limit",
-                inline=False
-            )
-
-        response_msg = await ctx.send(embed=embed)
-
-        channel_id = ctx.channel.id
-        message_id = response_msg.id
-
-        if channel_id not in prompt_messages:
-            prompt_messages[channel_id] = {}
-
-        prompt_messages[channel_id][message_id] = {
-            'type': ai_type,
-            'user_id': ctx.author.id,
-            'prompt': prompt
-        }
-        save_data()
-
-        return response_msg
-
-@aicommand.command(name='ask')
-async def ask_command(ctx, *, question: str = ""):
-    if not question:
-        usage_embed = discord.Embed(
-            title="❓ Ask Command Usage",
-            description="Please provide a question after the command.",
-            color=discord.Color.blue()
-        )
-        usage_embed.add_field(
-            name="Format",
-            value="`!ask <your question>`",
-            inline=False
-        )
-        usage_embed.add_field(
-            name="Example",
-            value="`!ask What is the capital of France?`",
-            inline=False
-        )
-        await ctx.send(embed=usage_embed)
-        return
-
-    await _send_and_store_ai_response(ctx, question, 'ask', 500, 0.7)
-
-@aicommand.command(name='generate')
-@commands.has_permissions(administrator=True)
-async def generate_command(ctx, *, prompt: str = ""):
-    if not prompt:
-        usage_embed = discord.Embed(
-            title="✨ Generate Command Usage",
-            description="Please provide a creative prompt after the command.",
-            color=discord.Color.purple()
-        )
-        usage_embed.add_field(
-            name="Format",
-            value="`!generate <your creative prompt>`",
-            inline=False
-        )
-        usage_embed.add_field(
-            name="Example",
-            value="`!generate Write a short poem about coding`",
-            inline=False
-        )
-        await ctx.send(embed=usage_embed)
-        return
-
-    await _send_and_store_ai_response(ctx, prompt, 'generate', 800, 0.9)
-
-@aicommand.command(name='prompt')
-@commands.has_permissions(administrator=True)
-async def prompt_command(ctx, *, user_prompt: str = ""):
-    if not user_prompt:
-        usage_embed = discord.Embed(
-            title="💭 Prompt Command Usage",
-            description="Please provide a prompt after the command.",
-            color=discord.Color.green()
-        )
-        usage_embed.add_field(
-            name="Format",
-            value="`!prompt <your prompt>`",
-            inline=False
-        )
-        usage_embed.add_field(
-            name="Example",
-            value="`!prompt Explain quantum computing in simple terms`",
-            inline=False
-        )
-        await ctx.send(embed=usage_embed)
-        return
-
-    response_msg = await _send_and_store_ai_response(ctx, user_prompt, 'prompt', 600, 0.8)
-
-    if response_msg:
-        try:
-            await ctx.message.delete()
-        except:
-            pass
-
-@bot.command(name='imagegenerate', aliases=['genimage', 'imagegen'])
-@commands.has_permissions(administrator=True)
-async def imagegenerate_command(ctx, *, prompt: str = ""):
-    if not gemini_client:
-        error_embed = discord.Embed(
-            title="❌ Configuration Error",
-            description="Gemini API key is not configured. Please contact the bot administrator.",
-            color=discord.Color.red()
-        )
-        await ctx.send(embed=error_embed)
-        return
-
-    if not prompt:
-        usage_embed = discord.Embed(
-            title="🎨 Image Generate Command Usage",
-            description="Generate AI images using Google Gemini",
-            color=discord.Color.purple()
-        )
-        usage_embed.add_field(
-            name="Format",
-            value="`!imagegenerate <description>`",
-            inline=False
-        )
-        usage_embed.add_field(
-            name="Example",
-            value="`!imagegenerate A futuristic cityscape at sunset with flying cars`",
-            inline=False
-        )
-        usage_embed.set_footer(text="Admin only • Powered by Google Gemini")
-        await ctx.send(embed=usage_embed)
-        return
-
-    async with ctx.typing():
-        try:
-            response = gemini_client.models.generate_images(
-                model='imagen-3.0-generate-001',
-                prompt=prompt,
-                config={
-                    'number_of_images': 1,
-                    'aspect_ratio': '1:1',
-                    'safety_filter_level': 'block_some',
-                    'person_generation': 'allow_all'
-                }
-            )
-
-            if response.generated_images:
-                generated_image = response.generated_images[0].image
-
-                img_byte_arr = io.BytesIO()
-                generated_image.save(img_byte_arr, format='PNG')
-                img_byte_arr.seek(0)
-
-                file = discord.File(img_byte_arr, filename="generated_image.png")
-
-                embed = discord.Embed(
-                    description=f"**Prompt:** {prompt}",
-                    color=discord.Color.purple()
-                )
-                embed.set_image(url="attachment://generated_image.png")
-                embed.set_footer(text=f"Generated by {ctx.author.display_name} • Google Imagen")
-
-                await ctx.send(embed=embed, file=file)
-
-        except Exception as e:
-            error_embed = discord.Embed(
-                title="❌ Image Generation Failed",
-                description=f"Failed to generate image: {str(e)}",
-                color=discord.Color.red()
-            )
-            await ctx.send(embed=error_embed)
-            print(f"Gemini Error: {e}")
-
-async def _edit_ai_response(ctx, message_id: int, new_prompt: str, ai_type: str, max_tokens: int, temperature: float):
-    if not _check_ai_config(ctx):
-        return
-
-    try:
-        original_msg = await ctx.channel.fetch_message(message_id)
-    except discord.NotFound:
-        embed = discord.Embed(title="❌ Message Not Found", description="The provided message ID is invalid or the message was deleted.", color=discord.Color.red())
-        await ctx.send(embed=embed, delete_after=10)
-        return
-    except Exception as e:
-        embed = discord.Embed(title="❌ Error Fetching Message", description=f"An error occurred: {e}", color=discord.Color.red())
-        await ctx.send(embed=embed, delete_after=10)
-        return
-
-    channel_id = ctx.channel.id
-    if channel_id not in prompt_messages or message_id not in prompt_messages[channel_id]:
-        embed = discord.Embed(title="❌ Not an AI Response", description="This message was not generated by a recognizable AI command or the data was lost.", color=discord.Color.red())
-        await ctx.send(embed=embed, delete_after=10)
-        return
-
-    message_data = prompt_messages[channel_id][message_id]
-
-    if ai_type not in ['aiedit'] and message_data['type'] != ai_type:
-        embed = discord.Embed(title="❌ Invalid Edit Command", description=f"This message was generated with `!{message_data['type']}`. Use `!{message_data['type']}edit` or `!aiedit` to modify it.", color=discord.Color.red())
-        await ctx.send(embed=embed, delete_after=10)
-        return
-
-    if not (ctx.author.id == message_data['user_id'] or ctx.author.guild_permissions.administrator):
-        embed = discord.Embed(title="❌ Permission Denied", description="You can only edit your own AI responses, or you must have Administrator permissions.", color=discord.Color.red())
-        await ctx.send(embed=embed, delete_after=10)
-        return
-
-    loading_embed = discord.Embed(
-        title="🔄 Editing AI Response...",
-        description=f"Processing new prompt: *{new_prompt[:100]}...*",
-        color=discord.Color.orange()
-    )
-    await original_msg.edit(embed=loading_embed)
-
-    new_answer = None
+    await interaction.response.defer()
+    
+    answer = None
     ai_provider = None
 
     if openai_client:
@@ -535,406 +465,232 @@ async def _edit_ai_response(ctx, message_id: int, new_prompt: str, ai_type: str,
             response = await openai_client.chat.completions.create(
                 model="gpt-4o-mini",
                 messages=[
-                    {"role": "user", "content": new_prompt}
+                    {"role": "user", "content": prompt}
                 ],
                 max_tokens=max_tokens,
                 temperature=temperature
             )
-            new_answer = response.choices[0].message.content or "No response generated"
+            answer = response.choices[0].message.content or "No response generated"
             ai_provider = "OpenAI"
         except Exception as e:
-            print(f"OpenAI API Error in edit: {e}")
+            print(f"OpenAI API Error: {e}")
             if not gemini_client:
-                error_embed = discord.Embed(
-                    title="❌ Error During Edit",
-                    description=f"Failed to regenerate response: {str(e)}",
+                embed = discord.Embed(
+                    title="❌ Error",
+                    description=f"Failed to generate response with OpenAI: {str(e)}",
                     color=discord.Color.red()
                 )
-                await original_msg.edit(embed=error_embed)
+                await interaction.followup.send(embed=embed)
                 return
 
-    if not new_answer and gemini_client:
+    if not answer and gemini_client:
         try:
             response = gemini_client.models.generate_content(
                 model="gemini-2.0-flash-exp",
-                contents=[new_prompt]
+                contents=[prompt]
             )
-            new_answer = response.text or "No response generated"
+            answer = response.text or "No response generated"
             ai_provider = "Gemini"
         except Exception as e:
-            error_embed = discord.Embed(
-                title="❌ Error During Edit",
-                description=f"Failed to regenerate response: {str(e)}",
+            embed = discord.Embed(
+                title="❌ Error",
+                description=f"Failed to generate response with Gemini: {str(e)}",
                 color=discord.Color.red()
             )
-            await original_msg.edit(embed=error_embed)
-            print(f"Gemini API Error in edit: {e}")
+            await interaction.followup.send(embed=embed)
+            print(f"Gemini API Error: {e}")
             return
 
-    if not new_answer:
+    if not answer:
         return
 
     was_truncated = False
-    if len(new_answer) > MAX_EMBED_LENGTH - 100:
-        new_answer = new_answer[:MAX_EMBED_LENGTH - 103] + "..."
+    if len(answer) > MAX_EMBED_LENGTH - 100:
+        answer = answer[:MAX_EMBED_LENGTH - 103] + "..."
         was_truncated = True
 
-    original_type = message_data['type']
-    if original_type == 'ask':
+    if ai_type == 'ask':
         color = discord.Color.blue()
-    elif original_type == 'generate':
+    elif ai_type == 'generate':
         color = discord.Color.purple()
-    elif original_type == 'prompt':
+    elif ai_type == 'prompt':
         color = discord.Color.green()
     else:
         color = discord.Color.default()
 
-    final_embed = discord.Embed(
-        description=new_answer,
+    embed = discord.Embed(
+        description=answer,
         color=color
     )
-    final_embed.set_footer(text=f"Edited by {ctx.author.display_name} • {ai_provider}")
+    embed.set_footer(text=f"Prompted by {interaction.user.display_name} • {ai_provider}")
 
     if was_truncated:
-        final_embed.add_field(
+        embed.add_field(
             name="⚠️ Note",
             value="Response was truncated due to length limit",
             inline=False
         )
 
-    await original_msg.edit(embed=final_embed)
+    response_msg = await interaction.followup.send(embed=embed)
 
-    prompt_messages[channel_id][message_id]['prompt'] = new_prompt
+    channel_id = interaction.channel_id
+    message_id = response_msg.id
+
+    if channel_id not in prompt_messages:
+        prompt_messages[channel_id] = {}
+
+    prompt_messages[channel_id][message_id] = {
+        'type': ai_type,
+        'user_id': interaction.user.id,
+        'prompt': prompt
+    }
     save_data()
 
-    await ctx.send(f"✅ AI response (ID: `{message_id}`) successfully edited.", delete_after=5)
-    try:
-        await ctx.message.delete()
-    except:
-        pass
+@bot.tree.command(name="ask", description="Ask the AI a question")
+async def ask(interaction: discord.Interaction, question: str):
+    await _send_ai_response(interaction, question, 'ask', 500, 0.7)
 
-@aicommand.command(name='aiedit')
-@commands.has_permissions(administrator=True)
-async def aiedit_command(ctx, message_id: int = None, *, new_prompt: str = None):
-    if not message_id or not new_prompt:
-        usage_embed = discord.Embed(
-            title="📝 AIEdit Command Usage",
-            description="Allows an admin to regenerate *any* AI response with a new prompt.",
+@bot.tree.command(name="generate", description="Generate creative text with AI (Admin only)")
+@app_commands.checks.has_permissions(administrator=True)
+async def generate(interaction: discord.Interaction, prompt: str):
+    await _send_ai_response(interaction, prompt, 'generate', 800, 0.9)
+
+@bot.tree.command(name="prompt", description="Get a structured AI response (Admin only)")
+@app_commands.checks.has_permissions(administrator=True)
+async def prompt_cmd(interaction: discord.Interaction, user_prompt: str):
+    await _send_ai_response(interaction, user_prompt, 'prompt', 600, 0.8)
+
+@bot.tree.command(name="imagegenerate", description="Generate an AI image using Gemini (Admin only)")
+@app_commands.checks.has_permissions(administrator=True)
+async def imagegenerate(interaction: discord.Interaction, prompt: str):
+    if not gemini_client:
+        embed = discord.Embed(
+            title="❌ Configuration Error",
+            description="Gemini API key is not configured. Please contact the bot administrator.",
             color=discord.Color.red()
         )
-        usage_embed.add_field(name="Format", value="`!aiedit <message_id> <new_prompt>`", inline=False)
-        usage_embed.add_field(name="Example", value="`!aiedit 123456789012345678 Write a new response about bots`", inline=False)
-        await ctx.send(embed=usage_embed)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
         return
 
-    await _edit_ai_response(ctx, message_id, new_prompt, 'aiedit', 800, 0.9)
+    await interaction.response.defer()
 
-@aicommand.command(name='promptedit')
-@commands.has_permissions(administrator=True)
-async def promptedit_command(ctx, message_id: int = None, *, new_prompt: str = None):
-    if not message_id or not new_prompt:
-        usage_embed = discord.Embed(
-            title="📝 Prompt Edit Command Usage",
-            description="Re-generates a `!prompt` response with a new prompt.",
-            color=discord.Color.green()
-        )
-        usage_embed.add_field(name="Format", value="`!promptedit <message_id> <new_prompt>`", inline=False)
-        usage_embed.add_field(name="Example", value="`!promptedit 123456789012345678 New prompt text`", inline=False)
-        await ctx.send(embed=usage_embed)
-        return
-
-    await _edit_ai_response(ctx, message_id, new_prompt, 'prompt', 600, 0.8)
-
-@aicommand.command(name='generateedit')
-@commands.has_permissions(administrator=True)
-async def generateedit_command(ctx, message_id: int = None, *, new_prompt: str = None):
-    if not message_id or not new_prompt:
-        usage_embed = discord.Embed(
-            title="📝 Generate Edit Command Usage",
-            description="Re-generates a `!generate` response with a new prompt.",
-            color=discord.Color.purple()
-        )
-        usage_embed.add_field(name="Format", value="`!generateedit <message_id> <new_prompt>`", inline=False)
-        usage_embed.add_field(name="Example", value="`!generateedit 123456789012345678 New creative prompt`", inline=False)
-        await ctx.send(embed=usage_embed)
-        return
-
-    await _edit_ai_response(ctx, message_id, new_prompt, 'generate', 800, 0.9)
-
-@bot.command(name='ask')
-async def ask_standalone(ctx, *, question: str = ""):
-    if not question:
-        usage_embed = discord.Embed(
-            title="❓ Ask Command Usage",
-            description="Please provide a question after the command.",
-            color=discord.Color.blue()
-        )
-        usage_embed.add_field(
-            name="Format",
-            value="`!ask <your question>`",
-            inline=False
-        )
-        usage_embed.add_field(
-            name="Example",
-            value="`!ask What is the capital of France?`",
-            inline=False
-        )
-        await ctx.send(embed=usage_embed)
-        return
-    await _send_and_store_ai_response(ctx, question, 'ask', 500, 0.7)
-
-@bot.command(name='prompt')
-@commands.has_permissions(administrator=True)
-async def prompt_standalone(ctx, *, user_prompt: str = ""):
-    if not user_prompt:
-        usage_embed = discord.Embed(
-            title="💭 Prompt Command Usage",
-            description="Please provide a prompt after the command.",
-            color=discord.Color.green()
-        )
-        usage_embed.add_field(
-            name="Format",
-            value="`!prompt <your prompt>`",
-            inline=False
-        )
-        usage_embed.add_field(
-            name="Example",
-            value="`!prompt Explain quantum computing in simple terms`",
-            inline=False
-        )
-        await ctx.send(embed=usage_embed)
-        return
-    response_msg = await _send_and_store_ai_response(ctx, user_prompt, 'prompt', 600, 0.8)
-    if response_msg:
-        try:
-            await ctx.message.delete()
-        except:
-            pass
-
-@bot.command(name='generate')
-@commands.has_permissions(administrator=True)
-async def generate_standalone(ctx, *, prompt: str = ""):
-    if not prompt:
-        usage_embed = discord.Embed(
-            title="✨ Generate Command Usage",
-            description="Please provide a creative prompt after the command.",
-            color=discord.Color.purple()
-        )
-        usage_embed.add_field(
-            name="Format",
-            value="`!generate <your creative prompt>`",
-            inline=False
-        )
-        usage_embed.add_field(
-            name="Example",
-            value="`!generate Write a short poem about coding`",
-            inline=False
-        )
-        await ctx.send(embed=usage_embed)
-        return
-    await _send_and_store_ai_response(ctx, prompt, 'generate', 800, 0.9)
     try:
-        await ctx.message.delete()
-    except:
-        pass
+        response = gemini_client.models.generate_images(
+            model='imagen-3.0-generate-001',
+            prompt=prompt,
+            config={
+                'number_of_images': 1,
+                'aspect_ratio': '1:1',
+                'safety_filter_level': 'block_some',
+                'person_generation': 'allow_all'
+            }
+        )
 
-@bot.command(name='info', aliases=['stats'])
-async def info_command(ctx):
+        if response.generated_images:
+            generated_image = response.generated_images[0].image
+
+            img_byte_arr = io.BytesIO()
+            generated_image.save(img_byte_arr, format='PNG')
+            img_byte_arr.seek(0)
+
+            file = discord.File(img_byte_arr, filename="generated_image.png")
+
+            embed = discord.Embed(
+                description=f"**Prompt:** {prompt}",
+                color=discord.Color.purple()
+            )
+            embed.set_image(url="attachment://generated_image.png")
+            embed.set_footer(text=f"Generated by {interaction.user.display_name} • Google Imagen")
+
+            await interaction.followup.send(embed=embed, file=file)
+
+    except Exception as e:
+        embed = discord.Embed(
+            title="❌ Image Generation Failed",
+            description=f"Failed to generate image: {str(e)}",
+            color=discord.Color.red()
+        )
+        await interaction.followup.send(embed=embed)
+        print(f"Gemini Error: {e}")
+
+@bot.tree.command(name="info", description="Display bot information and uptime")
+async def info(interaction: discord.Interaction):
     if not hasattr(bot, 'start_time'):
-        await ctx.send("⏳ Bot is still starting up, please try again in a moment.")
+        await interaction.response.send_message("⏳ Bot is still starting up, please try again in a moment.", ephemeral=True)
         return
 
     uptime = discord.utils.utcnow() - bot.start_time
-    hours, remainder = divmod(int(uptime.total_seconds()), 3600)
+    days = uptime.days
+    hours, remainder = divmod(uptime.seconds, 3600)
     minutes, seconds = divmod(remainder, 60)
 
+    uptime_str = f"{days}d {hours}h {minutes}m {seconds}s"
+
     embed = discord.Embed(
-        title="🤖 Discord Bot Information",
-        description="A feature-rich moderation and AI assistant bot for Discord servers",
+        title="🤖 Bot Information",
         color=discord.Color.blue()
     )
+    embed.add_field(name="Bot Name", value=bot.user.name, inline=True)
+    embed.add_field(name="Bot ID", value=bot.user.id, inline=True)
+    embed.add_field(name="Uptime", value=uptime_str, inline=True)
+    embed.add_field(name="Servers", value=len(bot.guilds), inline=True)
+    embed.add_field(name="Discord.py Version", value=discord.__version__, inline=True)
+    
+    ai_status = "✅ Enabled" if (openai_client or gemini_client) else "❌ Disabled"
+    embed.add_field(name="AI Features", value=ai_status, inline=True)
+    
+    embed.set_thumbnail(url=bot.user.avatar.url if bot.user.avatar else None)
+    embed.set_footer(text=f"Requested by {interaction.user.display_name}")
 
-    embed.add_field(
-        name="📊 Bot Stats",
-        value=f"**Name:** {bot.user.name}\n**ID:** {bot.user.id}\n**Prefix:** `{BOT_PREFIX}`\n**Servers:** {len(bot.guilds)}\n**Uptime:** {hours}h {minutes}m {seconds}s",
-        inline=False
-    )
+    await interaction.response.send_message(embed=embed)
 
-    embed.add_field(
-        name="🛡️ Moderation",
-        value="• Kick, Ban, Timeout, Warn members\n• Untimeout & Unban commands\n• View and clear warnings",
-        inline=True
-    )
-
-    embed.add_field(
-        name="🤖 AI Features",
-        value="• Ask AI questions\n• Generate creative content\n• Generate AI images\n• Edit AI responses",
-        inline=True
-    )
-
-    embed.add_field(
-        name="🔒 Auto-Moderation",
-        value="• Anti-cursing protection\n• Anti-spam detection\n• Automatic timeouts",
-        inline=True
-    )
-
-    embed.add_field(
-        name="👥 Utilities",
-        value="• Member verification\n• Direct messaging\n• Feature management\n• Server announcements",
-        inline=True
-    )
-
-    embed.add_field(
-        name="📝 Useful Commands",
-        value=f"`{BOT_PREFIX}help` - View all commands\n`{BOT_PREFIX}feature` - View features\n`{BOT_PREFIX}verify` - Get verified",
-        inline=False
-    )
-
-    embed.set_footer(text=f"Discord.py v{discord.__version__} • Running 24/7")
-
-    await ctx.send(embed=embed)
-
-@bot.command(name='feature')
-async def feature_command(ctx, action: str = None, feature_name: str = None):
-    if action is None:
-        embed = discord.Embed(
-            title="⚙️ Bot Features Status",
-            description="Current status of all bot features",
-            color=discord.Color.green()
-        )
-
-        for feature, enabled in FEATURE_STATUS.items():
-            status = "✅ Enabled" if enabled else "❌ Disabled"
-            embed.add_field(name=f"**{feature.title()}**", value=status, inline=True)
-
-        embed.add_field(
-            name="📝 How to Use",
-            value=f"`{BOT_PREFIX}feature enable <feature_name>` - Enable a feature\n`{BOT_PREFIX}feature disable <feature_name>` - Disable a feature",
-            inline=False
-        )
-
-        embed.set_footer(text="Admin only for enable/disable actions")
-        await ctx.send(embed=embed)
-        return
-
-    if action.lower() not in ['enable', 'disable']:
-        await ctx.send(f"❌ Invalid action. Use `enable` or `disable`.")
-        return
-
-    if not feature_name:
-        await ctx.send(f"❌ Please specify a feature name. Available: {', '.join(FEATURE_STATUS.keys())}")
-        return
-
-    if not ctx.author.guild_permissions.administrator:
-        await ctx.send("❌ You need Administrator permissions to manage features.")
-        return
-
-    feature_name = feature_name.lower()
-    if feature_name not in FEATURE_STATUS:
-        await ctx.send(f"❌ Unknown feature. Available: {', '.join(FEATURE_STATUS.keys())}")
-        return
-
-    if action.lower() == 'enable':
-        FEATURE_STATUS[feature_name] = True
-        embed = discord.Embed(
-            title="✅ Feature Enabled",
-            description=f"The **{feature_name}** feature has been enabled.",
-            color=discord.Color.green()
-        )
-        await ctx.send(embed=embed)
-    else:
-        FEATURE_STATUS[feature_name] = False
-        embed = discord.Embed(
-            title="❌ Feature Disabled",
-            description=f"The **{feature_name}** feature has been disabled.",
-            color=discord.Color.red()
-        )
-        await ctx.send(embed=embed)
-
-@bot.command(name='kick')
-@commands.has_permissions(kick_members=True)
-async def kick_command(ctx, member: discord.Member = None, *, reason: str = "No reason provided"):
+@bot.tree.command(name="kick", description="Kick a member from the server")
+@app_commands.checks.has_permissions(kick_members=True)
+async def kick(interaction: discord.Interaction, member: discord.Member, reason: str = "No reason provided"):
     if not FEATURE_STATUS.get('kick'):
-        await ctx.send("❌ This command is currently disabled.")
-        return
-
-    if not member:
-        embed = discord.Embed(
-            title="❌ Usage",
-            description="`!kick @member [reason]`",
-            color=discord.Color.red()
-        )
-        await ctx.send(embed=embed)
-        return
-
-    if member.top_role >= ctx.author.top_role:
-        await ctx.send("❌ You cannot kick someone with a higher or equal role.")
+        await interaction.response.send_message("❌ This command is currently disabled.", ephemeral=True)
         return
 
     try:
         await member.kick(reason=reason)
+        
         embed = discord.Embed(
             title="👢 Member Kicked",
             description=f"{member.mention} has been kicked from the server.",
             color=discord.Color.orange()
         )
         embed.add_field(name="Reason", value=reason, inline=False)
-        embed.set_footer(text=f"Kicked by {ctx.author.display_name}")
-        await ctx.send(embed=embed)
+        embed.set_footer(text=f"Kicked by {interaction.user.display_name}")
+        await interaction.response.send_message(embed=embed)
     except Exception as e:
-        await ctx.send(f"❌ Failed to kick member: {e}")
+        await interaction.response.send_message(f"❌ Failed to kick member: {e}", ephemeral=True)
 
-@bot.command(name='ban')
-@commands.has_permissions(ban_members=True)
-async def ban_command(ctx, member: discord.Member = None, *, reason: str = "No reason provided"):
+@bot.tree.command(name="ban", description="Ban a member from the server")
+@app_commands.checks.has_permissions(ban_members=True)
+async def ban(interaction: discord.Interaction, member: discord.Member, reason: str = "No reason provided"):
     if not FEATURE_STATUS.get('ban'):
-        await ctx.send("❌ This command is currently disabled.")
-        return
-
-    if not member:
-        embed = discord.Embed(
-            title="❌ Usage",
-            description="`!ban @member [reason]`",
-            color=discord.Color.red()
-        )
-        await ctx.send(embed=embed)
-        return
-
-    if member.top_role >= ctx.author.top_role:
-        await ctx.send("❌ You cannot ban someone with a higher or equal role.")
+        await interaction.response.send_message("❌ This command is currently disabled.", ephemeral=True)
         return
 
     try:
         await member.ban(reason=reason)
+        
         embed = discord.Embed(
             title="🔨 Member Banned",
             description=f"{member.mention} has been banned from the server.",
             color=discord.Color.red()
         )
         embed.add_field(name="Reason", value=reason, inline=False)
-        embed.set_footer(text=f"Banned by {ctx.author.display_name}")
-        await ctx.send(embed=embed)
+        embed.set_footer(text=f"Banned by {interaction.user.display_name}")
+        await interaction.response.send_message(embed=embed)
     except Exception as e:
-        await ctx.send(f"❌ Failed to ban member: {e}")
+        await interaction.response.send_message(f"❌ Failed to ban member: {e}", ephemeral=True)
 
-@bot.command(name='timeout')
-@commands.has_permissions(moderate_members=True)
-async def timeout_command(ctx, member: discord.Member = None, duration: int = 10, *, reason: str = "No reason provided"):
+@bot.tree.command(name="timeout", description="Timeout a member temporarily")
+@app_commands.checks.has_permissions(moderate_members=True)
+async def timeout(interaction: discord.Interaction, member: discord.Member, duration: int, reason: str = "No reason provided"):
     if not FEATURE_STATUS.get('timeout'):
-        await ctx.send("❌ This command is currently disabled.")
-        return
-
-    if not member:
-        embed = discord.Embed(
-            title="❌ Usage",
-            description="`!timeout @member [duration_in_minutes] [reason]`",
-            color=discord.Color.red()
-        )
-        await ctx.send(embed=embed)
-        return
-
-    if member.top_role >= ctx.author.top_role:
-        await ctx.send("❌ You cannot timeout someone with a higher or equal role.")
+        await interaction.response.send_message("❌ This command is currently disabled.", ephemeral=True)
         return
 
     try:
@@ -942,92 +698,22 @@ async def timeout_command(ctx, member: discord.Member = None, duration: int = 10
         await member.timeout(timeout_until, reason=reason)
 
         embed = discord.Embed(
-            title="🔇 Member Timed Out",
-            description=f"{member.mention} has been timed out for {duration} minutes.",
+            title="⏱️ Member Timed Out",
+            description=f"{member.mention} has been timed out.",
             color=discord.Color.orange()
         )
+        embed.add_field(name="Duration", value=f"{duration} minutes", inline=False)
         embed.add_field(name="Reason", value=reason, inline=False)
-        embed.set_footer(text=f"Timed out by {ctx.author.display_name}")
-        await ctx.send(embed=embed)
+        embed.set_footer(text=f"Timed out by {interaction.user.display_name}")
+        await interaction.response.send_message(embed=embed)
     except Exception as e:
-        await ctx.send(f"❌ Failed to timeout member: {e}")
+        await interaction.response.send_message(f"❌ Failed to timeout member: {e}", ephemeral=True)
 
-@bot.command(name='untimeout')
-@commands.has_permissions(moderate_members=True)
-async def untimeout_command(ctx, member: discord.Member = None):
-    if not member:
-        embed = discord.Embed(
-            title="❌ Usage",
-            description="`!untimeout @member`",
-            color=discord.Color.red()
-        )
-        await ctx.send(embed=embed)
-        return
-
-    try:
-        await member.timeout(None, reason=f"Timeout removed by {ctx.author.display_name}")
-
-        embed = discord.Embed(
-            title="✅ Timeout Removed",
-            description=f"Timeout has been removed from {member.mention}.",
-            color=discord.Color.green()
-        )
-        embed.set_footer(text=f"Removed by {ctx.author.display_name}")
-        await ctx.send(embed=embed)
-    except Exception as e:
-        await ctx.send(f"❌ Failed to remove timeout: {e}")
-
-@bot.command(name='unban')
-@commands.has_permissions(ban_members=True)
-async def unban_command(ctx, user_id: str = None, *, reason: str = "No reason provided"):
-    if not user_id:
-        embed = discord.Embed(
-            title="❌ Usage",
-            description="`!unban <user_id> [reason]`",
-            color=discord.Color.red()
-        )
-        embed.add_field(
-            name="How to get User ID",
-            value="Enable Developer Mode in Discord settings, right-click the user, and select 'Copy ID'",
-            inline=False
-        )
-        await ctx.send(embed=embed)
-        return
-
-    try:
-        user_id = int(user_id)
-        user = await bot.fetch_user(user_id)
-        await ctx.guild.unban(user, reason=reason)
-
-        embed = discord.Embed(
-            title="✅ User Unbanned",
-            description=f"{user.mention} ({user.name}) has been unbanned from the server.",
-            color=discord.Color.green()
-        )
-        embed.add_field(name="Reason", value=reason, inline=False)
-        embed.set_footer(text=f"Unbanned by {ctx.author.display_name}")
-        await ctx.send(embed=embed)
-    except ValueError:
-        await ctx.send("❌ Invalid user ID. Please provide a valid numeric user ID.")
-    except discord.NotFound:
-        await ctx.send("❌ User not found or not banned.")
-    except Exception as e:
-        await ctx.send(f"❌ Failed to unban user: {e}")
-
-@bot.command(name='warn')
-@commands.has_permissions(kick_members=True)
-async def warn_command(ctx, member: discord.Member = None, *, reason: str = "No reason provided"):
+@bot.tree.command(name="warn", description="Issue a warning to a member")
+@app_commands.checks.has_permissions(kick_members=True)
+async def warn(interaction: discord.Interaction, member: discord.Member, reason: str = "No reason provided"):
     if not FEATURE_STATUS.get('warn'):
-        await ctx.send("❌ This command is currently disabled.")
-        return
-
-    if not member:
-        embed = discord.Embed(
-            title="❌ Usage",
-            description="`!warn @member [reason]`",
-            color=discord.Color.red()
-        )
-        await ctx.send(embed=embed)
+        await interaction.response.send_message("❌ This command is currently disabled.", ephemeral=True)
         return
 
     user_id = member.id
@@ -1036,7 +722,7 @@ async def warn_command(ctx, member: discord.Member = None, *, reason: str = "No 
 
     warning_data = {
         'reason': reason,
-        'warned_by': ctx.author.id,
+        'warned_by': interaction.user.id,
         'timestamp': datetime.datetime.now().isoformat()
     }
     user_warnings[user_id].append(warning_data)
@@ -1050,13 +736,13 @@ async def warn_command(ctx, member: discord.Member = None, *, reason: str = "No 
     )
     embed.add_field(name="Reason", value=reason, inline=False)
     embed.add_field(name="Total Warnings", value=str(total_warnings), inline=False)
-    embed.set_footer(text=f"Warned by {ctx.author.display_name}")
-    await ctx.send(embed=embed)
+    embed.set_footer(text=f"Warned by {interaction.user.display_name}")
+    await interaction.response.send_message(embed=embed)
 
     try:
         dm_embed = discord.Embed(
             title="⚠️ Warning",
-            description=f"You have been warned in **{ctx.guild.name}**.",
+            description=f"You have been warned in **{interaction.guild.name}**.",
             color=discord.Color.yellow()
         )
         dm_embed.add_field(name="Reason", value=reason, inline=False)
@@ -1065,21 +751,12 @@ async def warn_command(ctx, member: discord.Member = None, *, reason: str = "No 
     except:
         pass
 
-@bot.command(name='warnings')
-@commands.has_permissions(kick_members=True)
-async def warnings_command(ctx, member: discord.Member = None):
-    if not member:
-        embed = discord.Embed(
-            title="❌ Usage",
-            description="`!warnings @member`",
-            color=discord.Color.red()
-        )
-        await ctx.send(embed=embed)
-        return
-
+@bot.tree.command(name="warnings", description="View warnings for a member")
+@app_commands.checks.has_permissions(kick_members=True)
+async def warnings(interaction: discord.Interaction, member: discord.Member):
     user_id = member.id
     if user_id not in user_warnings or not user_warnings[user_id]:
-        await ctx.send(f"{member.mention} has no warnings.")
+        await interaction.response.send_message(f"{member.mention} has no warnings.", ephemeral=True)
         return
 
     embed = discord.Embed(
@@ -1088,7 +765,7 @@ async def warnings_command(ctx, member: discord.Member = None):
     )
 
     for i, warning in enumerate(user_warnings[user_id], 1):
-        warned_by = ctx.guild.get_member(warning['warned_by'])
+        warned_by = interaction.guild.get_member(warning['warned_by'])
         warned_by_name = warned_by.display_name if warned_by else "Unknown"
         timestamp = warning['timestamp'][:19]
 
@@ -1098,264 +775,185 @@ async def warnings_command(ctx, member: discord.Member = None):
             inline=False
         )
 
-    await ctx.send(embed=embed)
+    await interaction.response.send_message(embed=embed)
 
-@bot.command(name='clearwarnings')
-@commands.has_permissions(administrator=True)
-async def clearwarnings_command(ctx, member: discord.Member = None):
-    if not member:
-        embed = discord.Embed(
-            title="❌ Usage",
-            description="`!clearwarnings @member`",
-            color=discord.Color.red()
-        )
-        await ctx.send(embed=embed)
-        return
-
+@bot.tree.command(name="clearwarnings", description="Clear all warnings for a member")
+@app_commands.checks.has_permissions(administrator=True)
+async def clearwarnings(interaction: discord.Interaction, member: discord.Member):
     user_id = member.id
     if user_id in user_warnings:
         user_warnings[user_id] = []
-        await ctx.send(f"✅ All warnings cleared for {member.mention}.")
+        await interaction.response.send_message(f"✅ All warnings cleared for {member.mention}.")
     else:
-        await ctx.send(f"{member.mention} has no warnings to clear.")
+        await interaction.response.send_message(f"{member.mention} has no warnings to clear.", ephemeral=True)
 
-@bot.command(name='verify')
-async def verify_command(ctx):
-    if not ctx.guild:
-        await ctx.send("❌ This command can only be used in a server.")
+@bot.tree.command(name="verify", description="Get the Member role")
+async def verify(interaction: discord.Interaction):
+    if not interaction.guild:
+        await interaction.response.send_message("❌ This command can only be used in a server.", ephemeral=True)
         return
 
-    role = discord.utils.get(ctx.guild.roles, name=VERIFY_ROLE_NAME)
+    role = discord.utils.get(interaction.guild.roles, name=VERIFY_ROLE_NAME)
 
     if not role:
-        await ctx.send(f"❌ The verification role `{VERIFY_ROLE_NAME}` does not exist. Please contact an admin.")
+        await interaction.response.send_message(f"❌ The verification role `{VERIFY_ROLE_NAME}` does not exist. Please contact an admin.", ephemeral=True)
         return
 
-    if role in ctx.author.roles:
-        await ctx.send(f"✅ You are already verified!")
+    if role in interaction.user.roles:
+        await interaction.response.send_message(f"✅ You are already verified!", ephemeral=True)
         return
 
     try:
-        await ctx.author.add_roles(role)
+        await interaction.user.add_roles(role)
         embed = discord.Embed(
             title="✅ Verification Successful",
-            description=f"{ctx.author.mention}, you have been verified and granted the {role.mention} role!",
+            description=f"{interaction.user.mention}, you have been verified and granted the {role.mention} role!",
             color=discord.Color.green()
         )
-        await ctx.send(embed=embed)
+        await interaction.response.send_message(embed=embed)
     except Exception as e:
-        await ctx.send(f"❌ Failed to verify: {e}")
+        await interaction.response.send_message(f"❌ Failed to verify: {e}", ephemeral=True)
 
-@bot.command(name='mverify')
-@commands.has_permissions(kick_members=True)
-async def mverify_command(ctx, member: discord.Member = None):
-    if not ctx.guild:
-        await ctx.send("❌ This command can only be used in a server.")
-        return
-
-    if not member:
-        embed = discord.Embed(
-            title="❌ Usage",
-            description="`!mverify @member`",
-            color=discord.Color.red()
-        )
-        await ctx.send(embed=embed)
-        return
-
-    role = discord.utils.get(ctx.guild.roles, name=VERIFY_ROLE_NAME)
-
-    if not role:
-        await ctx.send(f"❌ The verification role `{VERIFY_ROLE_NAME}` does not exist. Please contact an admin.")
-        return
-
-    if role in member.roles:
-        await ctx.send(f"✅ {member.mention} is already verified!")
-        return
-
-    try:
-        await member.add_roles(role)
-        embed = discord.Embed(
-            title="✅ Member Verified",
-            description=f"{member.mention} has been verified and granted the {role.mention} role!",
-            color=discord.Color.green()
-        )
-        embed.set_footer(text=f"Verified by {ctx.author.display_name}")
-        await ctx.send(embed=embed)
-    except Exception as e:
-        await ctx.send(f"❌ Failed to verify member: {e}")
-
-@bot.command(name='dm')
-@commands.has_permissions(administrator=True)
-async def dm_command(ctx, member: discord.Member = None, *, message: str = None):
+@bot.tree.command(name="dm", description="Send a DM to a user (Admin only)")
+@app_commands.checks.has_permissions(administrator=True)
+async def dm(interaction: discord.Interaction, member: discord.Member, message: str):
     if not FEATURE_STATUS.get('dm'):
-        await ctx.send("❌ This command is currently disabled.")
-        return
-
-    if not member or not message:
-        embed = discord.Embed(
-            title="❌ Usage",
-            description="`!dm @member <message>`",
-            color=discord.Color.red()
-        )
-        await ctx.send(embed=embed)
+        await interaction.response.send_message("❌ This command is currently disabled.", ephemeral=True)
         return
 
     try:
-        dm_embed = discord.Embed(
-            title=f"📧 Message from {ctx.guild.name}",
+        embed = discord.Embed(
+            title=f"📩 Message from {interaction.guild.name}",
             description=message,
             color=discord.Color.blue()
         )
-        dm_embed.set_footer(text=f"Sent by {ctx.author.display_name}")
-
-        await member.send(embed=dm_embed)
-        await ctx.send(f"✅ Message sent to {member.mention}.")
+        embed.set_footer(text=f"Sent by {interaction.user.display_name}")
+        await member.send(embed=embed)
+        await interaction.response.send_message(f"✅ DM sent to {member.mention}.", ephemeral=True)
     except discord.Forbidden:
-        await ctx.send(f"❌ Cannot send DM to {member.mention}. They may have DMs disabled.")
+        await interaction.response.send_message(f"❌ Cannot send DM to {member.mention}. They may have DMs disabled.", ephemeral=True)
     except Exception as e:
-        await ctx.send(f"❌ Failed to send DM: {e}")
+        await interaction.response.send_message(f"❌ Failed to send DM: {e}", ephemeral=True)
 
-@bot.command(name='dmeveryone')
-@commands.has_permissions(administrator=True)
-async def dmeveryone_command(ctx, *, message: str = None):
-    if not FEATURE_STATUS.get('dm'):
-        await ctx.send("❌ This command is currently disabled.")
+@bot.tree.command(name="ticketpanel", description="Create a ticket panel (Admin only)")
+@app_commands.checks.has_permissions(administrator=True)
+async def ticketpanel(interaction: discord.Interaction):
+    embed = discord.Embed(
+        title="🎫 Support Ticket System",
+        description="Need help? Click the button below to create a support ticket!\n\n"
+                    "**How it works:**\n"
+                    "• Click the 'Create Ticket' button\n"
+                    "• A private channel will be created for you\n"
+                    "• Only you and admins can see your ticket\n"
+                    "• Staff will assist you as soon as possible",
+        color=discord.Color.blue()
+    )
+    embed.set_footer(text="Tickets are private and only visible to you and staff")
+    
+    view = TicketPanelView()
+    await interaction.channel.send(embed=embed, view=view)
+    await interaction.response.send_message("✅ Ticket panel created!", ephemeral=True)
+
+@bot.tree.command(name="closeticket", description="Close a ticket channel (Admin only)")
+@app_commands.checks.has_permissions(administrator=True)
+async def closeticket(interaction: discord.Interaction):
+    channel = interaction.channel
+    guild_id = interaction.guild.id
+    
+    if guild_id in active_tickets and channel.id in active_tickets[guild_id]:
+        embed = discord.Embed(
+            title="🔒 Closing Ticket",
+            description="This ticket will be deleted in 5 seconds...",
+            color=discord.Color.red()
+        )
+        embed.set_footer(text=f"Closed by {interaction.user.display_name}")
+        
+        await interaction.response.send_message(embed=embed)
+        
+        active_tickets[guild_id].remove(channel.id)
+        if channel.id in ticket_claims:
+            del ticket_claims[channel.id]
+        save_data()
+        
+        await asyncio.sleep(5)
+        await channel.delete(reason=f"Ticket closed by {interaction.user.display_name}")
+    else:
+        await interaction.response.send_message("❌ This is not an active ticket channel.", ephemeral=True)
+
+@bot.tree.command(name="addsupportrole", description="Add a role that can manage tickets (Admin only)")
+@app_commands.checks.has_permissions(administrator=True)
+async def addsupportrole(interaction: discord.Interaction, role: discord.Role):
+    guild_id = interaction.guild.id
+    
+    if guild_id not in support_roles:
+        support_roles[guild_id] = []
+    
+    if role.id in support_roles[guild_id]:
+        await interaction.response.send_message(f"❌ {role.mention} is already a support role.", ephemeral=True)
         return
+    
+    support_roles[guild_id].append(role.id)
+    save_data()
+    
+    embed = discord.Embed(
+        title="✅ Support Role Added",
+        description=f"{role.mention} can now manage tickets!",
+        color=discord.Color.green()
+    )
+    await interaction.response.send_message(embed=embed)
 
-    if not message:
-        usage_embed = discord.Embed(
-            title="📧 DM Everyone Command",
-            description="Sends a direct message to all non-bot members in the server.",
-            color=discord.Color.blue()
-        )
-        usage_embed.add_field(
-            name="Usage",
-            value="`!dmeveryone <message>`",
-            inline=False
-        )
-        usage_embed.add_field(
-            name="Example",
-            value="`!dmeveryone Important server announcement!`",
-            inline=False
-        )
-        await ctx.send(embed=usage_embed, delete_after=10)
+@bot.tree.command(name="removesupportrole", description="Remove a support role (Admin only)")
+@app_commands.checks.has_permissions(administrator=True)
+async def removesupportrole(interaction: discord.Interaction, role: discord.Role):
+    guild_id = interaction.guild.id
+    
+    if guild_id not in support_roles or role.id not in support_roles[guild_id]:
+        await interaction.response.send_message(f"❌ {role.mention} is not a support role.", ephemeral=True)
         return
-
-    non_bot_members = [m for m in ctx.guild.members if not m.bot]
-
-    confirm_embed = discord.Embed(
-        title="⚠️ Confirm Mass DM",
-        description=f"Are you sure you want to send a DM to all {len(non_bot_members)} non-bot members?\n\nReact with ✅ to confirm or ❌ to cancel.",
+    
+    support_roles[guild_id].remove(role.id)
+    save_data()
+    
+    embed = discord.Embed(
+        title="✅ Support Role Removed",
+        description=f"{role.mention} can no longer manage tickets.",
         color=discord.Color.orange()
     )
-    confirm_msg = await ctx.send(embed=confirm_embed)
+    await interaction.response.send_message(embed=embed)
 
-    await confirm_msg.add_reaction("✅")
-    await confirm_msg.add_reaction("❌")
+@bot.tree.command(name="listsupportroles", description="List all support roles (Admin only)")
+@app_commands.checks.has_permissions(administrator=True)
+async def listsupportroles(interaction: discord.Interaction):
+    guild_id = interaction.guild.id
+    
+    if guild_id not in support_roles or not support_roles[guild_id]:
+        await interaction.response.send_message("❌ No support roles configured.", ephemeral=True)
+        return
+    
+    embed = discord.Embed(
+        title="🎫 Support Roles",
+        description="The following roles can manage tickets:",
+        color=discord.Color.blue()
+    )
+    
+    roles_list = []
+    for role_id in support_roles[guild_id]:
+        role = interaction.guild.get_role(role_id)
+        if role:
+            roles_list.append(role.mention)
+    
+    if roles_list:
+        embed.add_field(name="Roles", value="\n".join(roles_list), inline=False)
+    else:
+        embed.add_field(name="Roles", value="None (all roles have been deleted)", inline=False)
+    
+    await interaction.response.send_message(embed=embed)
 
-    def check(reaction, user):
-        return user == ctx.author and str(reaction.emoji) in ["✅", "❌"] and reaction.message.id == confirm_msg.id
+DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
 
-    try:
-        reaction, user = await bot.wait_for('reaction_add', timeout=30.0, check=check)
+if not DISCORD_TOKEN:
+    print("❌ Error: DISCORD_TOKEN not found in environment variables.")
+    print("Please set your Discord bot token in the .env file or secrets.")
+    exit(1)
 
-        if str(reaction.emoji) == "❌":
-            cancel_embed = discord.Embed(
-                title="❌ Cancelled",
-                description="Mass DM has been cancelled.",
-                color=discord.Color.red()
-            )
-            await confirm_msg.edit(embed=cancel_embed)
-            await confirm_msg.clear_reactions()
-            return
-
-        await confirm_msg.delete()
-
-        progress_embed = discord.Embed(
-            title="📤 Sending Mass DM...",
-            description="Please wait while messages are being sent. This may take a while.",
-            color=discord.Color.blue()
-        )
-        status_msg = await ctx.send(embed=progress_embed)
-
-        dm_embed = discord.Embed(
-            title=f"📢 Announcement from {ctx.guild.name}",
-            description=message,
-            color=discord.Color.blue()
-        )
-        dm_embed.set_footer(text=f"Sent by {ctx.author.display_name}")
-
-        success_count = 0
-        fail_count = 0
-
-        for member in non_bot_members:
-            if member.bot:
-                continue
-
-            try:
-                await member.send(embed=dm_embed)
-                success_count += 1
-                await asyncio.sleep(1)
-            except discord.Forbidden:
-                fail_count += 1
-            except Exception as e:
-                fail_count += 1
-                print(f"Failed to DM {member.display_name}: {e}")
-
-            if (success_count + fail_count) % 10 == 0 or (success_count + fail_count) == len(non_bot_members):
-                current_embed = discord.Embed(
-                    title="📤 Sending Mass DM...",
-                    description=f"Progress: {success_count + fail_count}/{len(non_bot_members)} members processed.",
-                    color=discord.Color.blue()
-                )
-                current_embed.add_field(name="✅ Successful", value=str(success_count), inline=True)
-                current_embed.add_field(name="❌ Failed", value=str(fail_count), inline=True)
-                await status_msg.edit(embed=current_embed)
-
-        result_embed = discord.Embed(
-            title="✅ Mass DM Complete",
-            description=f"DM sent to members.",
-            color=discord.Color.green()
-        )
-        result_embed.add_field(
-            name="✅ Successful",
-            value=str(success_count),
-            inline=True
-        )
-        result_embed.add_field(
-            name="❌ Failed",
-            value=str(fail_count),
-            inline=True
-        )
-
-        await status_msg.edit(embed=result_embed)
-
-        try:
-            await ctx.message.delete()
-        except:
-            pass
-
-    except asyncio.TimeoutError:
-        timeout_embed = discord.Embed(
-            title="⏱️ Timeout",
-            description="Confirmation timed out. Mass DM cancelled.",
-            color=discord.Color.red()
-        )
-        await confirm_msg.edit(embed=timeout_embed)
-        await confirm_msg.clear_reactions()
-    except Exception as e:
-        error_embed = discord.Embed(
-            title="❌ Error",
-            description=f"Failed to send mass DM: {str(e)}",
-            color=discord.Color.red()
-        )
-        await ctx.send(embed=error_embed)
-        print(f"Error in !dmeveryone: {e}")
-
-if __name__ == "__main__":
-    DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
-    if not DISCORD_TOKEN:
-        print("❌ Error: DISCORD_TOKEN not found in environment variables.")
-        exit(1)
-
-    bot.run(DISCORD_TOKEN)
+bot.run(DISCORD_TOKEN)
