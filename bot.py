@@ -983,6 +983,54 @@ async def dm(interaction: discord.Interaction, member: discord.Member, message: 
     except Exception as e:
         await interaction.response.send_message(f"❌ Failed to send DM: {e}", ephemeral=True)
 
+@bot.tree.command(name="dmeveryone", description="Send a DM to all server members (Admin only)")
+@app_commands.checks.has_permissions(administrator=True)
+async def dmeveryone(interaction: discord.Interaction, message: str):
+    await interaction.response.defer(ephemeral=True)
+    
+    guild = interaction.guild
+    members = [m for m in guild.members if not m.bot]
+    
+    if not members:
+        await interaction.followup.send("❌ No members to send DMs to.", ephemeral=True)
+        return
+    
+    embed = discord.Embed(
+        title=f"📢 Announcement from {guild.name}",
+        description=message,
+        color=discord.Color.purple()
+    )
+    embed.set_footer(text=f"Sent by {interaction.user.display_name}")
+    
+    success_count = 0
+    failed_count = 0
+    
+    status_embed = discord.Embed(
+        title="📨 Sending DMs...",
+        description=f"Sending to {len(members)} members...",
+        color=discord.Color.blue()
+    )
+    await interaction.followup.send(embed=status_embed, ephemeral=True)
+    
+    for member in members:
+        try:
+            await member.send(embed=embed)
+            success_count += 1
+        except discord.Forbidden:
+            failed_count += 1
+        except Exception as e:
+            print(f"Error sending DM to {member}: {e}")
+            failed_count += 1
+        finally:
+            await asyncio.sleep(0.5)
+    
+    result_embed = discord.Embed(
+        title="✅ DM Broadcast Complete",
+        description=f"**Sent:** {success_count}\n**Failed:** {failed_count}",
+        color=discord.Color.green()
+    )
+    await interaction.edit_original_response(embed=result_embed)
+
 @bot.tree.command(name="ticketpanel", description="Create a ticket panel (Admin only)")
 @app_commands.checks.has_permissions(administrator=True)
 async def ticketpanel(interaction: discord.Interaction):
