@@ -1,5 +1,5 @@
 discord.py==2.3.2
 python-dotenv==1.0.0
 openai
-google-genai==0.2.2
+google-genai
 Pillow==10.2.0
