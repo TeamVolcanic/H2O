@@ -1,3 +1,6 @@
 discord.py>=2.2.2
 python-dotenv
-google-generative-ai
+# google-generative-ai sometimes isn't available in all build environments.
+# Keep it out of the main list so Railway doesn't fail the build.
+# If you want build-time install, uncomment the next line:
+# google-generative-ai
