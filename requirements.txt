@@ -1,4 +1,3 @@
+discord.py>=2.2.2
+python-dotenv
 google-generative-ai
-# other dependencies, e.g.:
-# fastapi
-# uvicorn
