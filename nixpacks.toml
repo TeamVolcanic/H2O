@@ -1,5 +1,2 @@
 [build]
 builder = "nixpacks"
-
-[variables]
-NIXPACKS_PKGS = "ffmpeg"
