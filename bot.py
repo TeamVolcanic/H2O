@@ -3,23 +3,14 @@ from discord import app_commands
 from discord.ext import commands
 import os
 import datetime
-import re
 import asyncio
 import json
-from collections import deque
 from dotenv import load_dotenv
-from openai import AsyncOpenAI
-try:
-    import google.generativeai as genai
-    GENAI_AVAILABLE = True
-except ImportError:
-    genai = None
-    GENAI_AVAILABLE = False
-import io
 
-# Ensure ffmpeg is available on Railway
+# Install ffmpeg for Railway or Linux hosts
 os.system("apt-get update && apt-get install -y ffmpeg > /dev/null 2>&1")
 
+# === Load environment variables ===
 load_dotenv()
 
 # === Configuration ===
@@ -48,21 +39,24 @@ SPAM_COOLDOWN = 6
 SPAM_TIMEOUT_DURATION = datetime.timedelta(minutes=10)
 CURSING_TIMEOUT_DURATION = datetime.timedelta(minutes=5)
 
+# === Discord Intents ===
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 intents.voice_states = True
 
+# === Bot Class ===
 class MyBot(commands.Bot):
     def __init__(self):
         super().__init__(command_prefix="!", intents=intents)
+
     async def setup_hook(self):
         await self.tree.sync()
-        print("Commands synced.")
+        print("✅ Commands synced successfully.")
 
 bot = MyBot()
 
-# === MUSIC SYSTEM (FIXED FOR RAILWAY) ===
+# === MUSIC SYSTEM ===
 class MusicQueue:
     def __init__(self):
         self.queue = []
@@ -86,6 +80,8 @@ def get_music_queue(guild_id):
         guild_music_queues[guild_id] = MusicQueue()
     return guild_music_queues[guild_id]
 
+
+# === MUSIC COMMANDS ===
 @bot.tree.command(name="music", description="Play music from a YouTube URL")
 async def music(interaction: discord.Interaction, url: str):
     if not interaction.user.voice:
@@ -124,36 +120,49 @@ async def music(interaction: discord.Interaction, url: str):
     except Exception as e:
         await interaction.followup.send(f"❌ Failed to load: {e}")
 
+
 async def play_next_song(guild, music_queue):
     song = music_queue.next_song()
     if not song:
+        print(f"[{guild.name}] Queue empty — leaving voice channel.")
+        if music_queue.voice_client and music_queue.voice_client.is_connected():
+            await music_queue.voice_client.disconnect()
         return
 
-    def after_playing(error):
-        if error:
-            print(f"Playback error: {error}")
-        asyncio.run_coroutine_threadsafe(play_next_song(guild, music_queue), bot.loop)
+    print(f"[{guild.name}] Loading: {song['title']}")
 
     try:
         import yt_dlp
-        ydl_opts = {'format': 'bestaudio', 'quiet': True}
+        ydl_opts = {'format': 'bestaudio/best', 'quiet': True, 'noplaylist': True}
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(song['url'], download=False)
             stream_url = info['url']
 
+        ffmpeg_exe = "ffmpeg"
         ffmpeg_options = {
             'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
             'options': '-vn'
         }
 
+        def after_playing(error):
+            if error:
+                print(f"[{guild.name}] Playback error: {error}")
+            else:
+                print(f"[{guild.name}] Finished: {song['title']}")
+            asyncio.run_coroutine_threadsafe(play_next_song(guild, music_queue), bot.loop)
+
         music_queue.voice_client.play(
-            discord.FFmpegPCMAudio(stream_url, executable="/usr/bin/ffmpeg", **ffmpeg_options),
+            discord.FFmpegPCMAudio(stream_url, executable=ffmpeg_exe, **ffmpeg_options),
             after=after_playing
         )
-        print(f"Now playing: {song['title']}")
+
+        music_queue.current = song
+        print(f"[{guild.name}] Now playing: {song['title']}")
 
     except Exception as e:
-        print(f"FFmpeg or stream error: {e}")
+        print(f"[{guild.name}] ❌ Error playing {song['title']}: {e}")
+        await play_next_song(guild, music_queue)
+
 
 @bot.tree.command(name="musicskip", description="Skip the current song")
 async def musicskip(interaction: discord.Interaction):
@@ -167,6 +176,7 @@ async def musicskip(interaction: discord.Interaction):
     skipped = music_queue.current['title'] if music_queue.current else 'Unknown'
     music_queue.voice_client.stop()
     await interaction.response.send_message(embed=discord.Embed(title="⏭️ Skipped", description=f"**{skipped}**", color=discord.Color.orange()))
+
 
 @bot.tree.command(name="musicstop", description="Stop music and clear the queue")
 @app_commands.checks.has_permissions(administrator=True)
@@ -182,6 +192,27 @@ async def musicstop(interaction: discord.Interaction):
     await music_queue.voice_client.disconnect()
     music_queue.queue.clear()
     await interaction.response.send_message(embed=discord.Embed(title="⏹️ Stopped", description="Music stopped and bot disconnected.", color=discord.Color.red()))
+
+
+# === OPTIONAL: Volume Command ===
+@bot.tree.command(name="volume", description="Change playback volume (1-100)")
+async def volume(interaction: discord.Interaction, percent: int):
+    guild_id = interaction.guild.id
+    music_queue = get_music_queue(guild_id)
+
+    if not music_queue.voice_client or not music_queue.voice_client.is_playing():
+        await interaction.response.send_message("❌ Nothing is playing!", ephemeral=True)
+        return
+
+    if percent < 1 or percent > 100:
+        await interaction.response.send_message("⚠️ Please set a value between 1 and 100.", ephemeral=True)
+        return
+
+    # Note: Discord.py doesn't have built-in volume, must wrap source
+    music_queue.voice_client.source = discord.PCMVolumeTransformer(music_queue.voice_client.source)
+    music_queue.voice_client.source.volume = percent / 100
+    await interaction.response.send_message(f"🔊 Volume set to **{percent}%**")
+
 
 # === BOT RUN ===
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
