@@ -1,568 +1,1416 @@
-# railway_discord_bot.py
-# Discord moderation + music bot ready for Railway
-# Requires: Python 3.10+
-
-# Features:
-# - Slash commands: ban/unban, timeout/untimeout, warn/unwarn/viewwarns, dm/dmstop, dmeveryone/dmeveryonestop
-# - Toggleable features via /feature enable|disable <featurename>
-# - Anti-cursing (auto-timeout, customizable)
-# - Anti-spam (3 identical messages -> timeout, customizable)
-# - Persistent storage for warnings and settings (JSON files)
-# - Music commands: /music play <youtube_link>, /music skip, /music stop, /music queue
-# - Queueing, skip, stop supported
-
-# IMPORTANT: Put your bot token and optionally GUILD_ID in a .env file on Railway:
-# DISCORD_TOKEN=your_token_here
-# (optional) GUILD_ID=your_guild_id (as integer) -- if provided will register commands to that guild for fast updates
-
-# Requirements (put in requirements.txt):
-# discord.py>=2.3.2
-# PyNaCl
-# yt-dlp
-# aiohttp
-# python-dotenv
-
-# On Railway you also need FFmpeg available. If their environment doesn't already include ffmpeg,
-# you need to add a build step or use a Docker deployment that includes ffmpeg.
-
 import discord
 from discord import app_commands
-from discord.ext import commands, tasks
+from discord.ext import commands
 import os
-import json
-import asyncio
-import yt_dlp
-from dotenv import load_dotenv
-from datetime import datetime, timedelta
-from pathlib import Path
+import datetime
 import re
+import asyncio
+import json
+from collections import deque
+from dotenv import load_dotenv
+from openai import AsyncOpenAI
+try:
+    import google.generativeai as genai
+    GENAI_AVAILABLE = True
+except ImportError:
+    genai = None
+    GENAI_AVAILABLE = False
+import io
 
 load_dotenv()
-TOKEN = os.getenv('DISCORD_TOKEN')
-GUILD_ID = int(os.getenv('GUILD_ID')) if os.getenv('GUILD_ID') else None
 
-DATA_DIR = Path('data')
-DATA_DIR.mkdir(exist_ok=True)
-WARN_FILE = DATA_DIR / 'warns.json'
-FEATURE_FILE = DATA_DIR / 'features.json'
-DM_TASKS_FILE = DATA_DIR / 'dm_tasks.json'  # keep track of cancel tokens (not necessary to persist but fine)
+DEFAULT_VERIFY_ROLE_NAME = "🧑︱Member"
+COMMANDS_DATA_FILE = "commands_data.json"
+TICKETS_DATA_FILE = "tickets_data.json"
+TICKET_CATEGORY_NAME = "Tickets"
+SUPPORT_ROLES_FILE = "support_roles.json"
+VERIFY_ROLES_FILE = "verify_roles.json"
+MUSIC_QUEUES_FILE = "music_queues.json"
 
-# helper to load/save JSON
-def load_json(path, default):
-    if path.exists():
-        try:
-            return json.loads(path.read_text())
-        except Exception:
-            return default
-    return default
-
-def save_json(path, data):
-    path.write_text(json.dumps(data, indent=2))
-
-# persistent stores
-warns = load_json(WARN_FILE, {})
-features = load_json(FEATURE_FILE, {})
-# default features per guild if not set
-# structure: features[guild_id] = {"anti_cursing": True, "anti_cursing_timeout_mins":5, "anti_spam": True, "anti_spam_timeout_mins":3, "dm_cancellation": False }
-
-# quick list of cursewords (edit to taste)
-CURSE_WORDS = [
-    "fuck","shit","bitch","asshole","bastard","damn","cunt","motherfucker"
-]
-curse_pattern = re.compile(r"\b(?:" + "|".join(re.escape(w) for w in CURSE_WORDS) + r")\b", flags=re.IGNORECASE)
-
-intents = discord.Intents.default()
-intents.message_content = True
-intents.members = True
-intents.guilds = True
-
-bot = commands.Bot(command_prefix='!', intents=intents)
-
-# Music state per guild
-class MusicPlayer:
-    def __init__(self, guild_id):
-        self.guild_id = guild_id
-        self.queue = asyncio.Queue()
-        self.current = None
-        self.voice_client = None
-        self.play_task = None
-        self.skip_event = asyncio.Event()
-        self.stopped = False
-
-    async def connect(self, voice_channel: discord.VoiceChannel):
-        if self.voice_client and self.voice_client.is_connected():
-            await self.voice_client.move_to(voice_channel)
-            return self.voice_client
-        self.voice_client = await voice_channel.connect()
-        return self.voice_client
-
-    async def add_song(self, source):
-        await self.queue.put(source)
-        if not self.play_task or self.play_task.done():
-            self.play_task = asyncio.create_task(self.player_loop())
-
-    async def player_loop(self):
-        while not self.stopped:
-            try:
-                source = await self.queue.get()
-            except asyncio.CancelledError:
-                break
-            self.current = source
-            # play
-            if not self.voice_client or not self.voice_client.is_connected():
-                break
-            self.skip_event.clear()
-            fut = asyncio.get_event_loop().create_future()
-
-            def after_play(err):
-                if err:
-                    bot.loop.call_soon_threadsafe(fut.set_exception, err)
-                else:
-                    bot.loop.call_soon_threadsafe(fut.set_result, None)
-
-            self.voice_client.play(source, after=after_play)
-            try:
-                await fut
-            except Exception:
-                pass
-            self.current = None
-            # if stopped, break
-            if self.stopped:
-                break
-        # cleanup
-        if self.voice_client and self.voice_client.is_connected():
-            try:
-                await self.voice_client.disconnect()
-            except Exception:
-                pass
-
-music_players = {}  # guild_id -> MusicPlayer
-
-# yt-dlp helper to get best audio stream URL
-YTDLP_OPTS = {
-    'format': 'bestaudio/best',
-    'quiet': True,
-    'no_warnings': True,
-    'skip_download': True,
+FEATURE_STATUS = {
+    'info': True,
+    'kick': True,
+    'ban': True,
+    'timeout': True,
+    'cursing': True,
+    'spamming': True,
+    'dm': True,
+    'warn': True
 }
 
-dyld = yt_dlp.YoutubeDL(YTDLP_OPTS)
+BAD_WORDS = [
+    "fuck", "fucking", "fucked", "fucker", "fck", "f*ck",
+    "shit", "shitty", "shitting", "bullshit", "horseshit",
+    "goddamn", "bitch", "bitching", "bastard", "asshole",
+    "ass", "arse", "arsehole", "crap", "crappy", "piss",
+    "pissed", "pissing", "dick", "cock", "penis", "pussy",
+    "vagina", "cunt", "whore", "slut", "hoe", "prostitute",
+    "nigger", "nigga", "negro", "n*gger", "n*gga",
+    "fag", "faggot", "f*ggot", "dyke", "retard", "retarded",
+    "spastic", "coon", "chink", "gook", "wetback", "beaner",
+    "kike", "towelhead", "terrorist", "rape", "raping", "rapist",
+    "kill yourself", "kys", "suicide", "cancer", "aids",
+    "holocaust", "dork", "nazi", "hitler", "ahh", "slave", "slavery"
+]
 
-async def create_ffmpeg_source(url):
-    # use yt-dlp to extract direct audio url
-    loop = asyncio.get_event_loop()
-    info = await loop.run_in_executor(None, lambda: dyld.extract_info(url, download=False))
-    if 'url' in info:
-        audio_url = info['url']
-    elif 'entries' in info and len(info['entries'])>0:
-        audio_url = info['entries'][0]['url']
-    else:
-        raise RuntimeError('Could not extract audio')
-    # ffmpeg options - using pipe through FFmpegPCMAudio
-    return discord.FFmpegPCMAudio(audio_url, executable='ffmpeg', options='-vn')
+SPAM_THRESHOLD = 5
+SPAM_COOLDOWN = 6
+SPAM_TIMEOUT_DURATION = datetime.timedelta(minutes=10)
+CURSING_TIMEOUT_DURATION = datetime.timedelta(minutes=5)
+TICKET_COOLDOWN_DURATION = 60
+MAX_DM_PER_WARN = 5
+DM_DELAY = 0.5
+MAX_EMBED_LENGTH = 4096
 
-# ---------- utility functions for persistent settings ----------
+user_messages = {}
+active_dm_tasks = {}
+user_warnings = {}
+user_dm_limits = {}
+prompt_messages = {}
+ticket_counter = {}
+active_tickets = {}
+ticket_claims = {}
+support_roles = {}
+ticket_cooldowns = {}
+verify_roles = {}
+music_queues = {}
 
-def ensure_guild_features(guild_id: int):
-    if str(guild_id) not in features:
-        features[str(guild_id)] = {
-            'anti_cursing': True,
-            'anti_cursing_timeout_mins': 5,
-            'anti_spam': True,
-            'anti_spam_timeout_mins': 3,
-            'dm_cancel_tokens': {},
+BAD_WORDS_PATTERN = re.compile(
+    r'(' + '|'.join(re.escape(word) for word in BAD_WORDS) + r')',
+    re.IGNORECASE
+)
+
+intents = discord.Intents.default()
+intents.members = True
+intents.message_content = True
+intents.voice_states = True
+
+class MyBot(commands.Bot):
+    def __init__(self):
+        super().__init__(command_prefix="!", intents=intents)
+        
+    async def setup_hook(self):
+        await self.tree.sync()
+        print("Slash commands synced!")
+
+bot = MyBot()
+
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+if GEMINI_API_KEY and GENAI_AVAILABLE:
+    genai.configure(api_key=GEMINI_API_KEY)
+    gemini_client = True
+else:
+    gemini_client = None
+
+def load_data():
+    global prompt_messages, ticket_counter, active_tickets, ticket_claims, support_roles, verify_roles
+    try:
+        with open(COMMANDS_DATA_FILE, 'r') as f:
+            data = json.load(f)
+            prompt_messages = {int(k): {int(mk): mv for mk, mv in v.items()} for k, v in data.items()}
+    except FileNotFoundError:
+        print("No command data file found. Starting fresh.")
+    except Exception as e:
+        print(f"Error loading command data: {e}")
+    
+    try:
+        with open(TICKETS_DATA_FILE, 'r') as f:
+            tickets_data = json.load(f)
+            ticket_counter = {int(k): v for k, v in tickets_data.get('counter', {}).items()}
+            active_tickets = {int(k): v for k, v in tickets_data.get('active', {}).items()}
+            ticket_claims = {int(k): v for k, v in tickets_data.get('claims', {}).items()}
+    except FileNotFoundError:
+        print("No tickets data file found. Starting fresh.")
+    except Exception as e:
+        print(f"Error loading tickets data: {e}")
+    
+    try:
+        with open(SUPPORT_ROLES_FILE, 'r') as f:
+            support_roles_data = json.load(f)
+            support_roles = {int(k): v for k, v in support_roles_data.items()}
+    except FileNotFoundError:
+        print("No support roles file found. Starting fresh.")
+    except Exception as e:
+        print(f"Error loading support roles: {e}")
+    
+    try:
+        with open(VERIFY_ROLES_FILE, 'r') as f:
+            verify_roles_data = json.load(f)
+            verify_roles = {int(k): v for k, v in verify_roles_data.items()}
+    except FileNotFoundError:
+        print("No verify roles file found. Starting fresh.")
+    except Exception as e:
+        print(f"Error loading verify roles: {e}")
+
+def save_data():
+    try:
+        data_to_save = {str(k): {str(mk): mv for mk, mv in v.items()} for k, v in prompt_messages.items()}
+        with open(COMMANDS_DATA_FILE, 'w') as f:
+            json.dump(data_to_save, f, indent=4)
+    except Exception as e:
+        print(f"Error saving command data: {e}")
+    
+    try:
+        tickets_data = {
+            'counter': {str(k): v for k, v in ticket_counter.items()},
+            'active': {str(k): v for k, v in active_tickets.items()},
+            'claims': {str(k): v for k, v in ticket_claims.items()}
         }
-        save_json(FEATURE_FILE, features)
+        with open(TICKETS_DATA_FILE, 'w') as f:
+            json.dump(tickets_data, f, indent=4)
+    except Exception as e:
+        print(f"Error saving tickets data: {e}")
+    
+    try:
+        support_roles_data = {str(k): v for k, v in support_roles.items()}
+        with open(SUPPORT_ROLES_FILE, 'w') as f:
+            json.dump(support_roles_data, f, indent=4)
+    except Exception as e:
+        print(f"Error saving support roles: {e}")
+    
+    try:
+        verify_roles_data = {str(k): v for k, v in verify_roles.items()}
+        with open(VERIFY_ROLES_FILE, 'w') as f:
+            json.dump(verify_roles_data, f, indent=4)
+    except Exception as e:
+        print(f"Error saving verify roles: {e}")
 
-# warnings helpers
-
-def add_warn(guild_id: int, member_id: int, reason: str, moderator_id: int):
-    g = str(guild_id)
-    m = str(member_id)
-    if g not in warns:
-        warns[g] = {}
-    if m not in warns[g]:
-        warns[g][m] = []
-    warns[g][m].append({'reason': reason, 'moderator': moderator_id, 'time': datetime.utcnow().isoformat()})
-    save_json(WARN_FILE, warns)
-
-def remove_warn(guild_id: int, member_id: int, index: int):
-    g = str(guild_id)
-    m = str(member_id)
-    if g in warns and m in warns[g] and 0 <= index < len(warns[g][m]):
-        warns[g][m].pop(index)
-        save_json(WARN_FILE, warns)
+def can_manage_tickets(member: discord.Member, guild_id: int) -> bool:
+    if member.guild_permissions.administrator:
         return True
+    
+    if guild_id in support_roles:
+        for role_id in support_roles[guild_id]:
+            if member.get_role(role_id):
+                return True
+    
     return False
 
-# message history for anti-spam detection (in-memory)
-recent_messages = {}  # guild_id -> member_id -> list of last messages (content str)
+class TicketPanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
 
-# ---------- event handlers ----------
+    @discord.ui.button(label="Create Ticket", style=discord.ButtonStyle.green, custom_id="create_ticket", emoji="🎫")
+    async def create_ticket_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        
+        guild = interaction.guild
+        user = interaction.user
+        user_id = user.id
+        guild_id = guild.id
+        current_time = datetime.datetime.now().timestamp()
+        
+        if user_id in ticket_cooldowns:
+            time_since_last = current_time - ticket_cooldowns[user_id]
+            if time_since_last < TICKET_COOLDOWN_DURATION:
+                remaining = int(TICKET_COOLDOWN_DURATION - time_since_last)
+                await interaction.followup.send(
+                    f"⏱️ Please wait {remaining} seconds before creating another ticket.",
+                    ephemeral=True
+                )
+                return
+        
+        for channel_id in active_tickets.get(guild_id, []):
+            channel = guild.get_channel(channel_id)
+            if channel and user.id in [m.id for m in channel.members]:
+                await interaction.followup.send(
+                    f"❌ You already have an open ticket: {channel.mention}",
+                    ephemeral=True
+                )
+                return
+        
+        if guild_id not in ticket_counter:
+            ticket_counter[guild_id] = 0
+        
+        ticket_counter[guild_id] += 1
+        ticket_number = ticket_counter[guild_id]
+        ticket_name = f"ticket-{ticket_number:04d}"
+        
+        category = discord.utils.get(guild.categories, name=TICKET_CATEGORY_NAME)
+        if not category:
+            try:
+                category = await guild.create_category(TICKET_CATEGORY_NAME)
+            except Exception as e:
+                ticket_counter[guild_id] -= 1
+                await interaction.followup.send(
+                    f"❌ Failed to create ticket category: {e}",
+                    ephemeral=True
+                )
+                return
+        
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(read_messages=False),
+            user: discord.PermissionOverwrite(
+                read_messages=True,
+                send_messages=True,
+                attach_files=True,
+                embed_links=True
+            ),
+            guild.me: discord.PermissionOverwrite(
+                read_messages=True,
+                send_messages=True,
+                manage_channels=True
+            )
+        }
+        
+        for role in guild.roles:
+            if role.permissions.administrator:
+                overwrites[role] = discord.PermissionOverwrite(
+                    read_messages=True,
+                    send_messages=True,
+                    manage_messages=True
+                )
+        
+        if guild_id in support_roles:
+            for role_id in support_roles[guild_id]:
+                role = guild.get_role(role_id)
+                if role:
+                    overwrites[role] = discord.PermissionOverwrite(
+                        read_messages=True,
+                        send_messages=True,
+                        manage_messages=True
+                    )
+        
+        try:
+            ticket_channel = await guild.create_text_channel(
+                name=ticket_name,
+                category=category,
+                overwrites=overwrites,
+                topic=f"Ticket created by {user.display_name} ({user.id})"
+            )
+            
+            if guild_id not in active_tickets:
+                active_tickets[guild_id] = []
+            active_tickets[guild_id].append(ticket_channel.id)
+            
+            ticket_cooldowns[user_id] = current_time
+            
+            save_data()
+            
+            embed = discord.Embed(
+                title="🎫 Ticket Created",
+                description=f"Welcome {user.mention}! Please describe your issue and a staff member will assist you shortly.",
+                color=discord.Color.green()
+            )
+            embed.add_field(
+                name="Ticket Number",
+                value=f"#{ticket_number:04d}",
+                inline=True
+            )
+            embed.add_field(
+                name="Created By",
+                value=user.mention,
+                inline=True
+            )
+            embed.add_field(
+                name="Status",
+                value="⏳ Unclaimed",
+                inline=True
+            )
+            embed.set_footer(text="Staff: Use the buttons below to manage this ticket")
+            
+            view = TicketControlsView()
+            await ticket_channel.send(embed=embed, view=view)
+            
+            await interaction.followup.send(
+                f"✅ Ticket created: {ticket_channel.mention}",
+                ephemeral=True
+            )
+            
+        except Exception as e:
+            ticket_counter[guild_id] -= 1
+            await interaction.followup.send(
+                f"❌ Failed to create ticket: {e}",
+                ephemeral=True
+            )
+
+class TicketControlsView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Claim Ticket", style=discord.ButtonStyle.primary, custom_id="claim_ticket", emoji="✋")
+    async def claim_ticket_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        guild_id = interaction.guild.id
+        ticket_id = interaction.channel.id
+        
+        if not can_manage_tickets(interaction.user, guild_id):
+            await interaction.response.send_message(
+                "❌ You don't have permission to claim tickets.",
+                ephemeral=True
+            )
+            return
+        
+        if ticket_id in ticket_claims and ticket_claims[ticket_id]:
+            current_claimer = interaction.guild.get_member(ticket_claims[ticket_id])
+            if current_claimer:
+                await interaction.response.send_message(
+                    f"❌ This ticket is already claimed by {current_claimer.mention}",
+                    ephemeral=True
+                )
+                return
+        
+        ticket_claims[ticket_id] = interaction.user.id
+        save_data()
+        
+        embed = discord.Embed(
+            title="✅ Ticket Claimed",
+            description=f"{interaction.user.mention} is now handling this ticket.",
+            color=discord.Color.blue()
+        )
+        await interaction.response.send_message(embed=embed)
+        
+        async for msg in interaction.channel.history(limit=10):
+            if msg.embeds and "Ticket Created" in msg.embeds[0].title:
+                new_embed = msg.embeds[0]
+                for i, field in enumerate(new_embed.fields):
+                    if field.name == "Status":
+                        new_embed.set_field_at(i, name="Status", value=f"✅ Claimed by {interaction.user.mention}", inline=True)
+                await msg.edit(embed=new_embed)
+                break
+
+    @discord.ui.button(label="Close Ticket", style=discord.ButtonStyle.danger, custom_id="close_ticket", emoji="🔒")
+    async def close_ticket_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        guild_id = interaction.guild.id
+        
+        if not can_manage_tickets(interaction.user, guild_id):
+            await interaction.response.send_message(
+                "❌ You don't have permission to close tickets.",
+                ephemeral=True
+            )
+            return
+        
+        channel = interaction.channel
+        
+        if guild_id in active_tickets and channel.id in active_tickets[guild_id]:
+            embed = discord.Embed(
+                title="🔒 Closing Ticket",
+                description="This ticket will be deleted in 5 seconds...",
+                color=discord.Color.red()
+            )
+            embed.set_footer(text=f"Closed by {interaction.user.display_name}")
+            
+            await interaction.response.send_message(embed=embed)
+            
+            active_tickets[guild_id].remove(channel.id)
+            if channel.id in ticket_claims:
+                del ticket_claims[channel.id]
+            save_data()
+            
+            await asyncio.sleep(5)
+            await channel.delete(reason=f"Ticket closed by {interaction.user.display_name}")
+        else:
+            await interaction.response.send_message("❌ This is not an active ticket channel.", ephemeral=True)
 
 @bot.event
 async def on_ready():
-    print('Bot ready. Logged in as', bot.user)
-    # register commands to guild if provided (fast updates) or globally if not.
-    if GUILD_ID:
-        guild = discord.Object(id=GUILD_ID)
-        try:
-            await bot.tree.sync(guild=guild)
-            print('Synced commands to guild', GUILD_ID)
-        except Exception as e:
-            print('Failed to sync to guild:', e)
-    else:
-        try:
-            await bot.tree.sync()
-            print('Synced global commands')
-        except Exception as e:
-            print('Failed to global sync:', e)
+    bot.start_time = discord.utils.utcnow()
+    print(f'Bot is ready. Logged in as: {bot.user}')
+    print(f'Bot ID: {bot.user.id}')
+    print(f'Connected to {len(bot.guilds)} guild(s)')
+    if not openai_client:
+        print("⚠️  Warning: OPENAI_API_KEY not found. AI commands will not work.")
+    load_data()
+    print("Command data loaded.")
+    
+    bot.add_view(TicketPanelView())
+    bot.add_view(TicketControlsView())
+    print("Ticket views registered.")
 
 @bot.event
-async def on_message(message: discord.Message):
-    # ignore bot messages
+async def on_message(message):
     if message.author.bot:
         return
-    guild = message.guild
-    if not guild:
-        return
-    ensure_guild_features(guild.id)
-    gf = features[str(guild.id)]
 
-    # anti-cursing
-    if gf.get('anti_cursing', False):
-        if curse_pattern.search(message.content or ''):
-            # timeout the user for configured minutes
-            mins = gf.get('anti_cursing_timeout_mins', 5)
-            until = datetime.utcnow() + timedelta(minutes=mins)
-            try:
-                await message.author.edit(timed_out_until=until)
-                await message.channel.send(f"{message.author.mention} was automatically timed out for {mins} minutes (anti-cursing).")
-            except Exception:
-                await message.channel.send("Failed to apply timeout (missing permissions?)")
-            # optionally delete the message
+    if FEATURE_STATUS.get('cursing') and message.guild:
+        if BAD_WORDS_PATTERN.search(message.content):
             try:
                 await message.delete()
-            except Exception:
-                pass
-            return
-    # anti-spam (three identical messages)
-    if gf.get('anti_spam', False):
-        gid = str(guild.id)
-        mid = str(message.author.id)
-        recent_messages.setdefault(gid, {}).setdefault(mid, [])
-        hist = recent_messages[gid][mid]
-        hist.append(message.content)
-        # keep last 5
-        if len(hist) > 5:
-            hist.pop(0)
-        if len(hist) >= 3 and hist[-1] == hist[-2] == hist[-3]:
-            mins = gf.get('anti_spam_timeout_mins', 3)
-            until = datetime.utcnow() + timedelta(minutes=mins)
-            try:
-                await message.author.edit(timed_out_until=until)
-                await message.channel.send(f"{message.author.mention} was automatically timed out for {mins} minutes (anti-spam).")
-            except Exception:
-                await message.channel.send("Failed to apply timeout (missing permissions?)")
-            # clear history for that user
-            recent_messages[gid][mid] = []
-            # delete message(s)
-            try:
-                await message.delete()
-            except Exception:
-                pass
-            return
-    # process commands (discord.py builtin message handling is disabled for slash-only, but we keep on_message to monitor content)
-    await bot.process_commands(message)
+                embed = discord.Embed(
+                    title="⚠️ Inappropriate Language Detected",
+                    description=f"{message.author.mention}, please keep the chat clean and respectful.",
+                    color=discord.Color.orange()
+                )
+                bot_name = bot.user.name if bot.user else "Bot"
+                embed.set_footer(text=f"Message deleted by {bot_name}")
+                await message.channel.send(embed=embed, delete_after=5)
 
-# ---------- Slash commands (app_commands) ----------
+                timeout_until = discord.utils.utcnow() + CURSING_TIMEOUT_DURATION
+                await message.author.timeout(timeout_until, reason="Using inappropriate language")
 
-def mod_check(interaction: discord.Interaction):
-    # require manage_messages or administrator
-    if not interaction.user.guild_permissions.manage_messages and not interaction.user.guild_permissions.administrator:
-        raise app_commands.AppCommandError("You must have Manage Messages or Administrator permissions to use this command.")
+                dm_embed = discord.Embed(
+                    title="🚫 Timeout Notice",
+                    description=f"You have been timed out in **{message.guild.name}** for using inappropriate language.",
+                    color=discord.Color.red()
+                )
+                dm_embed.add_field(
+                    name="Duration",
+                    value=f"{CURSING_TIMEOUT_DURATION.seconds // 60} minutes",
+                    inline=False
+                )
+                try:
+                    await message.author.send(embed=dm_embed)
+                except:
+                    pass
+            except Exception as e:
+                print(f"Error handling bad words: {e}")
+
+    if FEATURE_STATUS.get('spamming') and message.guild:
+        user_id = message.author.id
+        current_time = datetime.datetime.now()
+
+        if user_id not in user_messages:
+            user_messages[user_id] = deque(maxlen=SPAM_THRESHOLD)
+
+        user_messages[user_id].append(current_time)
+
+        if len(user_messages[user_id]) == SPAM_THRESHOLD:
+            time_diff = (current_time - user_messages[user_id][0]).total_seconds()
+
+            if time_diff <= SPAM_COOLDOWN:
+                try:
+                    timeout_until = discord.utils.utcnow() + SPAM_TIMEOUT_DURATION
+                    await message.author.timeout(timeout_until, reason="Spamming messages")
+
+                    embed = discord.Embed(
+                        title="🚫 Anti-Spam Protection",
+                        description=f"{message.author.mention} has been timed out for spamming.",
+                        color=discord.Color.red()
+                    )
+                    embed.add_field(
+                        name="Duration",
+                        value=f"{SPAM_TIMEOUT_DURATION.seconds // 60} minutes",
+                        inline=False
+                    )
+                    await message.channel.send(embed=embed, delete_after=10)
+
+                    user_messages[user_id].clear()
+                except Exception as e:
+                    print(f"Error handling spam: {e}")
+
+def _check_ai_config(interaction):
+    if not openai_client and not gemini_client:
+        return False
     return True
 
-# Ban
-@bot.tree.command(name='ban', description='Ban a user')
-@app_commands.describe(member='Member to ban', reason='Reason for ban')
-async def ban(interaction: discord.Interaction, member: discord.Member, reason: str = 'No reason provided'):
-    try:
-        await interaction.response.defer()
-        await member.ban(reason=reason)
-        await interaction.followup.send(f'{member} has been banned. Reason: {reason}')
-    except Exception as e:
-        await interaction.followup.send('Could not ban user: ' + str(e))
+async def _send_ai_response(interaction: discord.Interaction, prompt: str, ai_type: str, max_tokens: int, temperature: float):
+    if not _check_ai_config(interaction):
+        embed = discord.Embed(
+            title="❌ Configuration Error",
+            description="Neither OpenAI nor Gemini API key is configured. Please contact the bot administrator.",
+            color=discord.Color.red()
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        return
 
-# Unban
-@bot.tree.command(name='unban', description='Unban a user by ID')
-@app_commands.describe(user_id='User ID to unban')
+    await interaction.response.defer()
+    
+    answer = None
+    ai_provider = None
+
+    if openai_client:
+        try:
+            response = await openai_client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "user", "content": prompt}
+                ],
+                max_tokens=max_tokens,
+                temperature=temperature
+            )
+            answer = response.choices[0].message.content or "No response generated"
+            ai_provider = "OpenAI"
+        except Exception as e:
+            print(f"OpenAI API Error: {e}")
+            if not gemini_client:
+                embed = discord.Embed(
+                    title="❌ Error",
+                    description=f"Failed to generate response with OpenAI: {str(e)}",
+                    color=discord.Color.red()
+                )
+                await interaction.followup.send(embed=embed)
+                return
+
+    if not answer and gemini_client and GENAI_AVAILABLE:
+        try:
+            model = genai.GenerativeModel("gemini-pro")
+            response = model.generate_content(prompt)
+            answer = response.text or "No response generated"
+            ai_provider = "Gemini"
+        except Exception as e:
+            embed = discord.Embed(
+                title="❌ Error",
+                description=f"Failed to generate response with Gemini: {str(e)}",
+                color=discord.Color.red()
+            )
+            await interaction.followup.send(embed=embed)
+            print(f"Gemini API Error: {e}")
+            return
+
+    if not answer:
+        return
+
+    was_truncated = False
+    if len(answer) > MAX_EMBED_LENGTH - 100:
+        answer = answer[:MAX_EMBED_LENGTH - 103] + "..."
+        was_truncated = True
+
+    if ai_type == 'ask':
+        color = discord.Color.blue()
+    elif ai_type == 'generate':
+        color = discord.Color.purple()
+    elif ai_type == 'prompt':
+        color = discord.Color.green()
+    else:
+        color = discord.Color.default()
+
+    embed = discord.Embed(
+        description=answer,
+        color=color
+    )
+    embed.set_footer(text=f"Prompted by {interaction.user.display_name} • {ai_provider}")
+
+    if was_truncated:
+        embed.add_field(
+            name="⚠️ Note",
+            value="Response was truncated due to length limit",
+            inline=False
+        )
+
+    response_msg = await interaction.followup.send(embed=embed)
+
+    channel_id = interaction.channel_id
+    message_id = response_msg.id
+
+    if channel_id not in prompt_messages:
+        prompt_messages[channel_id] = {}
+
+    prompt_messages[channel_id][message_id] = {
+        'type': ai_type,
+        'user_id': interaction.user.id,
+        'prompt': prompt
+    }
+    save_data()
+
+@bot.tree.command(name="ask", description="Ask the AI a question")
+async def ask(interaction: discord.Interaction, question: str):
+    await _send_ai_response(interaction, question, 'ask', 500, 0.7)
+
+@bot.tree.command(name="generate", description="Generate creative text with AI (Admin only)")
+@app_commands.checks.has_permissions(administrator=True)
+async def generate(interaction: discord.Interaction, prompt: str):
+    await _send_ai_response(interaction, prompt, 'generate', 800, 0.9)
+
+@bot.tree.command(name="prompt", description="Get a structured AI response (Admin only)")
+@app_commands.checks.has_permissions(administrator=True)
+async def prompt_cmd(interaction: discord.Interaction, user_prompt: str):
+    await _send_ai_response(interaction, user_prompt, 'prompt', 600, 0.8)
+
+@bot.tree.command(name="imagegenerate", description="Generate an AI image using Gemini (Admin only)")
+@app_commands.checks.has_permissions(administrator=True)
+async def imagegenerate(interaction: discord.Interaction, prompt: str):
+    if not gemini_client or not GENAI_AVAILABLE:
+        embed = discord.Embed(
+            title="❌ Configuration Error",
+            description="Gemini API is not available or configured. Please contact the bot administrator.",
+            color=discord.Color.red()
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        return
+
+    await interaction.response.defer()
+
+    try:
+        model = genai.GenerativeModel("gemini-pro-vision")
+        response = model.generate_content(f"Generate an image: {prompt}")
+        
+        embed = discord.Embed(
+            title="ℹ️ Image Generation Not Available",
+            description="The current Gemini API configuration doesn't support image generation. This feature requires Imagen API access.",
+            color=discord.Color.blue()
+        )
+        await interaction.followup.send(embed=embed)
+
+    except Exception as e:
+        embed = discord.Embed(
+            title="❌ Image Generation Failed",
+            description=f"Failed to generate image: {str(e)}",
+            color=discord.Color.red()
+        )
+        await interaction.followup.send(embed=embed)
+
+@bot.tree.command(name="info", description="Display bot information")
+async def info(interaction: discord.Interaction):
+    if not FEATURE_STATUS.get('info'):
+        await interaction.response.send_message("❌ This command is currently disabled.", ephemeral=True)
+        return
+
+    if not hasattr(bot, 'start_time'):
+        await interaction.response.send_message("❌ Bot startup information not available yet.", ephemeral=True)
+        return
+
+    uptime = discord.utils.utcnow() - bot.start_time
+    days = uptime.days
+    hours, remainder = divmod(uptime.seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+
+    uptime_str = f"{days}d {hours}h {minutes}m {seconds}s"
+
+    embed = discord.Embed(
+        title="🤖 Bot Information",
+        color=discord.Color.blue()
+    )
+    embed.add_field(name="Bot Name", value=bot.user.name, inline=True)
+    embed.add_field(name="Bot ID", value=bot.user.id, inline=True)
+    embed.add_field(name="Uptime", value=uptime_str, inline=True)
+    embed.add_field(name="Servers", value=len(bot.guilds), inline=True)
+    embed.add_field(name="Discord.py Version", value=discord.__version__, inline=True)
+    
+    ai_status = "✅ Enabled" if (openai_client or gemini_client) else "❌ Disabled"
+    embed.add_field(name="AI Features", value=ai_status, inline=True)
+    
+    embed.set_thumbnail(url=bot.user.avatar.url if bot.user.avatar else None)
+    embed.set_footer(text=f"Requested by {interaction.user.display_name}")
+
+    await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name="kick", description="Kick a member from the server")
+@app_commands.checks.has_permissions(kick_members=True)
+async def kick(interaction: discord.Interaction, member: discord.Member, reason: str = "No reason provided"):
+    if not FEATURE_STATUS.get('kick'):
+        await interaction.response.send_message("❌ This command is currently disabled.", ephemeral=True)
+        return
+
+    try:
+        await member.kick(reason=reason)
+        
+        embed = discord.Embed(
+            title="👢 Member Kicked",
+            description=f"{member.mention} has been kicked from the server.",
+            color=discord.Color.orange()
+        )
+        embed.add_field(name="Reason", value=reason, inline=False)
+        embed.set_footer(text=f"Kicked by {interaction.user.display_name}")
+        await interaction.response.send_message(embed=embed)
+    except Exception as e:
+        await interaction.response.send_message(f"❌ Failed to kick member: {e}", ephemeral=True)
+
+@bot.tree.command(name="ban", description="Ban a member from the server")
+@app_commands.checks.has_permissions(ban_members=True)
+async def ban(interaction: discord.Interaction, member: discord.Member, reason: str = "No reason provided"):
+    if not FEATURE_STATUS.get('ban'):
+        await interaction.response.send_message("❌ This command is currently disabled.", ephemeral=True)
+        return
+
+    try:
+        await member.ban(reason=reason)
+        
+        embed = discord.Embed(
+            title="🔨 Member Banned",
+            description=f"{member.mention} has been banned from the server.",
+            color=discord.Color.red()
+        )
+        embed.add_field(name="Reason", value=reason, inline=False)
+        embed.set_footer(text=f"Banned by {interaction.user.display_name}")
+        await interaction.response.send_message(embed=embed)
+    except Exception as e:
+        await interaction.response.send_message(f"❌ Failed to ban member: {e}", ephemeral=True)
+
+@bot.tree.command(name="unban", description="Unban a user from the server")
+@app_commands.checks.has_permissions(ban_members=True)
 async def unban(interaction: discord.Interaction, user_id: str):
     try:
-        await interaction.response.defer()
-        user = await bot.fetch_user(int(user_id))
-        await interaction.guild.unban(user)
-        await interaction.followup.send(f'Unbanned {user}.')
+        user_id_int = int(user_id)
+        user = await bot.fetch_user(user_id_int)
+        
+        await interaction.guild.unban(user, reason=f"Unbanned by {interaction.user.display_name}")
+        
+        embed = discord.Embed(
+            title="✅ User Unbanned",
+            description=f"**{user.name}** (ID: {user_id}) has been unbanned from the server.",
+            color=discord.Color.green()
+        )
+        embed.set_footer(text=f"Unbanned by {interaction.user.display_name}")
+        await interaction.response.send_message(embed=embed)
+    except ValueError:
+        await interaction.response.send_message("❌ Invalid user ID. Please provide a valid numeric user ID.", ephemeral=True)
+    except discord.NotFound:
+        await interaction.response.send_message("❌ User not found or not banned.", ephemeral=True)
     except Exception as e:
-        await interaction.followup.send('Could not unban: ' + str(e))
+        await interaction.response.send_message(f"❌ Failed to unban user: {e}", ephemeral=True)
 
-# Timeout
-@bot.tree.command(name='timeout', description='Timeout a member for X minutes')
-@app_commands.describe(member='Member to timeout', minutes='Minutes to timeout', reason='Reason')
-async def timeout(interaction: discord.Interaction, member: discord.Member, minutes: int = 5, reason: str = 'No reason provided'):
+@bot.tree.command(name="timeout", description="Timeout a member temporarily")
+@app_commands.checks.has_permissions(moderate_members=True)
+async def timeout(interaction: discord.Interaction, member: discord.Member, duration: int, reason: str = "No reason provided"):
+    if not FEATURE_STATUS.get('timeout'):
+        await interaction.response.send_message("❌ This command is currently disabled.", ephemeral=True)
+        return
+
     try:
-        await interaction.response.defer()
-        until = datetime.utcnow() + timedelta(minutes=minutes)
-        await member.edit(timed_out_until=until)
-        await interaction.followup.send(f'{member.mention} timed out for {minutes} minutes. Reason: {reason}')
-    except Exception as e:
-        await interaction.followup.send('Could not timeout: ' + str(e))
+        timeout_until = discord.utils.utcnow() + datetime.timedelta(minutes=duration)
+        await member.timeout(timeout_until, reason=reason)
 
-# Untimeout
-@bot.tree.command(name='untimeout', description='Remove timeout from a member')
-@app_commands.describe(member='Member to remove timeout')
+        embed = discord.Embed(
+            title="⏱️ Member Timed Out",
+            description=f"{member.mention} has been timed out.",
+            color=discord.Color.orange()
+        )
+        embed.add_field(name="Duration", value=f"{duration} minutes", inline=False)
+        embed.add_field(name="Reason", value=reason, inline=False)
+        embed.set_footer(text=f"Timed out by {interaction.user.display_name}")
+        await interaction.response.send_message(embed=embed)
+    except Exception as e:
+        await interaction.response.send_message(f"❌ Failed to timeout member: {e}", ephemeral=True)
+
+@bot.tree.command(name="untimeout", description="Remove timeout from a member")
+@app_commands.checks.has_permissions(moderate_members=True)
 async def untimeout(interaction: discord.Interaction, member: discord.Member):
     try:
-        await interaction.response.defer()
-        await member.edit(timed_out_until=None)
-        await interaction.followup.send(f'{member.mention} is no longer timed out.')
+        if member.timed_out_until is None:
+            await interaction.response.send_message(f"❌ {member.mention} is not currently timed out.", ephemeral=True)
+            return
+        
+        await member.timeout(None, reason=f"Timeout removed by {interaction.user.display_name}")
+        
+        embed = discord.Embed(
+            title="✅ Timeout Removed",
+            description=f"{member.mention}'s timeout has been removed.",
+            color=discord.Color.green()
+        )
+        embed.set_footer(text=f"Timeout removed by {interaction.user.display_name}")
+        await interaction.response.send_message(embed=embed)
     except Exception as e:
-        await interaction.followup.send('Could not remove timeout: ' + str(e))
+        await interaction.response.send_message(f"❌ Failed to remove timeout: {e}", ephemeral=True)
 
-# Warn
-@bot.tree.command(name='warn', description='Add a warning to a user')
-@app_commands.describe(member='Member to warn', reason='Reason for warn')
-async def warn_cmd(interaction: discord.Interaction, member: discord.Member, reason: str):
-    try:
-        await interaction.response.defer()
-        add_warn(interaction.guild.id, member.id, reason, interaction.user.id)
-        await interaction.followup.send(f'{member.mention} has been warned. Reason: {reason}')
-    except Exception as e:
-        await interaction.followup.send('Could not add warn: ' + str(e))
-
-# Unwarn - remove by index (0-based shown to moderator)
-@bot.tree.command(name='unwarn', description='Remove a warn by index (0-based)')
-@app_commands.describe(member='Member', index='Index of warn to remove (0-based)')
-async def unwarn(interaction: discord.Interaction, member: discord.Member, index: int):
-    try:
-        await interaction.response.defer()
-        ok = remove_warn(interaction.guild.id, member.id, index)
-        if ok:
-            await interaction.followup.send('Warning removed.')
-        else:
-            await interaction.followup.send('Could not remove warning (invalid index).')
-    except Exception as e:
-        await interaction.followup.send('Error: ' + str(e))
-
-# Viewwarns
-@bot.tree.command(name='viewwarns', description='View warns for a member')
-@app_commands.describe(member='Member to view warns for')
-async def viewwarns(interaction: discord.Interaction, member: discord.Member):
-    try:
-        await interaction.response.defer()
-        g = str(interaction.guild.id)
-        m = str(member.id)
-        if g in warns and m in warns[g] and warns[g][m]:
-            items = warns[g][m]
-            lines = []
-            for i, w in enumerate(items):
-                lines.append(f"{i}: {w['time']} by <@{w['moderator']}> — {w['reason']}")
-            await interaction.followup.send('\n'.join(lines))
-        else:
-            await interaction.followup.send('No warnings for that member.')
-    except Exception as e:
-        await interaction.followup.send('Error: ' + str(e))
-
-# DM single user
-@bot.tree.command(name='dm', description='Send a DM to a user')
-@app_commands.describe(member='Member to DM', message='Message content')
-async def dm(interaction: discord.Interaction, member: discord.Member, message: str):
-    try:
-        await interaction.response.defer()
-        await member.send(message)
-        await interaction.followup.send('DM sent.')
-    except Exception as e:
-        await interaction.followup.send('Could not send DM: ' + str(e))
-
-# DM everyone (careful) — this will spawn a background task but supports cancellation via dmeveryonestop
-@bot.tree.command(name='dmeveryone', description='DM every member (admins only)')
-@app_commands.describe(message='Message to send to everyone')
-async def dmeveryone(interaction: discord.Interaction, message: str):
-    # permission check
-    if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message('Administrator permission required.')
+@bot.tree.command(name="warn", description="Issue a warning to a member")
+@app_commands.checks.has_permissions(kick_members=True)
+async def warn(interaction: discord.Interaction, member: discord.Member, reason: str = "No reason provided"):
+    if not FEATURE_STATUS.get('warn'):
+        await interaction.response.send_message("❌ This command is currently disabled.", ephemeral=True)
         return
-    await interaction.response.defer()
-    gid = str(interaction.guild.id)
-    ensure_guild_features(interaction.guild.id)
-    cancel_token = str(datetime.utcnow().timestamp())
-    features[gid].setdefault('dm_cancel_tokens', {})[cancel_token] = False
-    save_json(FEATURE_FILE, features)
 
-    async def sender_task():
+    user_id = member.id
+    if user_id not in user_warnings:
+        user_warnings[user_id] = []
+
+    warning_data = {
+        'reason': reason,
+        'warned_by': interaction.user.id,
+        'timestamp': datetime.datetime.now().isoformat()
+    }
+    user_warnings[user_id].append(warning_data)
+
+    total_warnings = len(user_warnings[user_id])
+
+    embed = discord.Embed(
+        title="⚠️ Member Warned",
+        description=f"{member.mention} has been warned.",
+        color=discord.Color.yellow()
+    )
+    embed.add_field(name="Reason", value=reason, inline=False)
+    embed.add_field(name="Total Warnings", value=str(total_warnings), inline=False)
+    embed.set_footer(text=f"Warned by {interaction.user.display_name}")
+    await interaction.response.send_message(embed=embed)
+
+    try:
+        dm_embed = discord.Embed(
+            title="⚠️ Warning",
+            description=f"You have been warned in **{interaction.guild.name}**.",
+            color=discord.Color.yellow()
+        )
+        dm_embed.add_field(name="Reason", value=reason, inline=False)
+        dm_embed.add_field(name="Total Warnings", value=str(total_warnings), inline=False)
+        await member.send(embed=dm_embed)
+    except:
+        pass
+
+@bot.tree.command(name="warnings", description="View warnings for a member")
+@app_commands.checks.has_permissions(kick_members=True)
+async def warnings(interaction: discord.Interaction, member: discord.Member):
+    user_id = member.id
+    if user_id not in user_warnings or not user_warnings[user_id]:
+        await interaction.response.send_message(f"{member.mention} has no warnings.", ephemeral=True)
+        return
+
+    embed = discord.Embed(
+        title=f"⚠️ Warnings for {member.display_name}",
+        color=discord.Color.yellow()
+    )
+
+    for i, warning in enumerate(user_warnings[user_id], 1):
+        warned_by = interaction.guild.get_member(warning['warned_by'])
+        warned_by_name = warned_by.display_name if warned_by else "Unknown"
+        timestamp = warning['timestamp'][:19]
+
+        embed.add_field(
+            name=f"Warning #{i}",
+            value=f"**Reason:** {warning['reason']}\n**By:** {warned_by_name}\n**Date:** {timestamp}",
+            inline=False
+        )
+
+    await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name="clearwarnings", description="Clear all warnings for a member")
+@app_commands.checks.has_permissions(administrator=True)
+async def clearwarnings(interaction: discord.Interaction, member: discord.Member):
+    user_id = member.id
+    if user_id in user_warnings:
+        user_warnings[user_id] = []
+        await interaction.response.send_message(f"✅ All warnings cleared for {member.mention}.")
+    else:
+        await interaction.response.send_message(f"{member.mention} has no warnings to clear.", ephemeral=True)
+
+@bot.tree.command(name="verify", description="Get the Member role")
+async def verify(interaction: discord.Interaction):
+    if not interaction.guild:
+        await interaction.response.send_message("❌ This command can only be used in a server.", ephemeral=True)
+        return
+
+    guild_id = interaction.guild.id
+    role_name = verify_roles.get(guild_id, DEFAULT_VERIFY_ROLE_NAME)
+    role = discord.utils.get(interaction.guild.roles, name=role_name)
+
+    if not role:
+        await interaction.response.send_message(f"❌ The verification role `{role_name}` does not exist. Please contact an admin.", ephemeral=True)
+        return
+
+    if role in interaction.user.roles:
+        await interaction.response.send_message(f"✅ You are already verified!", ephemeral=True)
+        return
+
+    try:
+        await interaction.user.add_roles(role)
+        embed = discord.Embed(
+            title="✅ Verification Successful",
+            description=f"{interaction.user.mention}, you have been verified and granted the {role.mention} role!",
+            color=discord.Color.green()
+        )
+        await interaction.response.send_message(embed=embed)
+    except Exception as e:
+        await interaction.response.send_message(f"❌ Failed to verify: {e}", ephemeral=True)
+
+@bot.tree.command(name="mverify", description="Manually verify a member by giving them the Member role (Admin only)")
+@app_commands.checks.has_permissions(administrator=True)
+async def mverify(interaction: discord.Interaction, member: discord.Member):
+    if not interaction.guild:
+        await interaction.response.send_message("❌ This command can only be used in a server.", ephemeral=True)
+        return
+
+    guild_id = interaction.guild.id
+    role_name = verify_roles.get(guild_id, DEFAULT_VERIFY_ROLE_NAME)
+    role = discord.utils.get(interaction.guild.roles, name=role_name)
+
+    if not role:
+        await interaction.response.send_message(f"❌ The verification role `{role_name}` does not exist. Please contact an admin.", ephemeral=True)
+        return
+
+    if role in member.roles:
+        await interaction.response.send_message(f"❌ {member.mention} is already verified!", ephemeral=True)
+        return
+
+    try:
+        await member.add_roles(role)
+        embed = discord.Embed(
+            title="✅ Member Verified",
+            description=f"{member.mention} has been manually verified by {interaction.user.mention} and granted the {role.mention} role!",
+            color=discord.Color.green()
+        )
+        embed.set_footer(text=f"Verified by {interaction.user.display_name}")
+        await interaction.response.send_message(embed=embed)
+        
         try:
-            for member in interaction.guild.members:
-                if features[gid].get('dm_cancel_tokens', {}).get(cancel_token):
-                    # canceled
-                    break
-                if member.bot:
-                    continue
-                try:
-                    await member.send(message)
-                except Exception:
-                    pass
-                await asyncio.sleep(0.3)  # small delay to avoid rate limits
-        finally:
-            # clean token
-            features[gid].get('dm_cancel_tokens', {}).pop(cancel_token, None)
-            save_json(FEATURE_FILE, features)
+            dm_embed = discord.Embed(
+                title="✅ Verified!",
+                description=f"You have been verified in **{interaction.guild.name}** by an administrator!",
+                color=discord.Color.green()
+            )
+            await member.send(embed=dm_embed)
+        except:
+            pass
+    except Exception as e:
+        await interaction.response.send_message(f"❌ Failed to verify member: {e}", ephemeral=True)
 
-    bot.loop.create_task(sender_task())
-    await interaction.followup.send('Started DMeveryone task. Use /dmeveryonestop to cancel.')
+@bot.tree.command(name="setverifyrole", description="Set the verification role name for this server (Admin only)")
+@app_commands.checks.has_permissions(administrator=True)
+async def setverifyrole(interaction: discord.Interaction, role_name: str):
+    guild_id = interaction.guild.id
+    verify_roles[guild_id] = role_name
+    save_data()
+    
+    embed = discord.Embed(
+        title="✅ Verification Role Set",
+        description=f"The verification role has been set to: **{role_name}**\n\nMake sure this role exists in your server!",
+        color=discord.Color.green()
+    )
+    embed.set_footer(text=f"Set by {interaction.user.display_name}")
+    await interaction.response.send_message(embed=embed)
 
-@bot.tree.command(name='dmeveryonestop', description='Stop active DMeveryone task')
-async def dmeveryonestop(interaction: discord.Interaction):
-    if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message('Administrator permission required.')
-        return
-    gid = str(interaction.guild.id)
-    ensure_guild_features(interaction.guild.id)
-    # set all tokens to True (cancel)
-    for t in list(features[gid].get('dm_cancel_tokens', {}).keys()):
-        features[gid]['dm_cancel_tokens'][t] = True
-    save_json(FEATURE_FILE, features)
-    await interaction.response.send_message('Requested cancellation of any active DMeveryone tasks.')
-
-# DM stop — cancel ongoing individual DM runs if you implement any long running ones; here it's alias
-@bot.tree.command(name='dmstop', description='(Alias) Stop active DM tasks')
-async def dmstop(interaction: discord.Interaction):
-    await dmeveryonestop(interaction)
-
-# Feature enable/disable
-@bot.tree.command(name='feature', description='Enable or disable a named feature')
-@app_commands.describe(action='enable or disable', feature='Feature name')
+@bot.tree.command(name="feature", description="Enable or disable bot features (Admin only)")
+@app_commands.checks.has_permissions(administrator=True)
+@app_commands.describe(
+    action="Choose to enable or disable the feature",
+    feature="The feature to enable/disable"
+)
+@app_commands.choices(action=[
+    app_commands.Choice(name="Enable", value="enable"),
+    app_commands.Choice(name="Disable", value="disable")
+])
+@app_commands.choices(feature=[
+    app_commands.Choice(name="Info Command", value="info"),
+    app_commands.Choice(name="Kick Command", value="kick"),
+    app_commands.Choice(name="Ban Command", value="ban"),
+    app_commands.Choice(name="Timeout Command", value="timeout"),
+    app_commands.Choice(name="Cursing Filter", value="cursing"),
+    app_commands.Choice(name="Spam Protection", value="spamming"),
+    app_commands.Choice(name="DM Command", value="dm"),
+    app_commands.Choice(name="Warn Command", value="warn")
+])
 async def feature(interaction: discord.Interaction, action: str, feature: str):
-    if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message('Administrator permission required.')
+    if feature not in FEATURE_STATUS:
+        await interaction.response.send_message(f"❌ Invalid feature: {feature}", ephemeral=True)
         return
-    await interaction.response.defer()
-    gid = str(interaction.guild.id)
-    ensure_guild_features(interaction.guild.id)
-    feat = feature.lower()
-    if action.lower() == 'enable':
-        features[gid][feat] = True
-        save_json(FEATURE_FILE, features)
-        await interaction.followup.send(f'Feature {feat} enabled.')
-    elif action.lower() == 'disable':
-        features[gid][feat] = False
-        save_json(FEATURE_FILE, features)
-        await interaction.followup.send(f'Feature {feat} disabled.')
+    
+    if action == "enable":
+        FEATURE_STATUS[feature] = True
+        status = "enabled"
+        color = discord.Color.green()
+        emoji = "✅"
     else:
-        await interaction.followup.send('Action must be enable or disable.')
+        FEATURE_STATUS[feature] = False
+        status = "disabled"
+        color = discord.Color.red()
+        emoji = "🔒"
+    
+    feature_names = {
+        'info': 'Info Command',
+        'kick': 'Kick Command',
+        'ban': 'Ban Command',
+        'timeout': 'Timeout Command',
+        'cursing': 'Cursing Filter',
+        'spamming': 'Spam Protection',
+        'dm': 'DM Command',
+        'warn': 'Warn Command'
+    }
+    
+    embed = discord.Embed(
+        title=f"{emoji} Feature {status.capitalize()}",
+        description=f"The **{feature_names.get(feature, feature)}** has been {status}.",
+        color=color
+    )
+    embed.set_footer(text=f"Changed by {interaction.user.display_name}")
+    await interaction.response.send_message(embed=embed)
 
-# Set timeout values for features
-@bot.tree.command(name='settimeout', description='Set timeout minutes for a feature (anti_cursing / anti_spam)')
-@app_commands.describe(feature='Feature name', minutes='Minutes')
-async def settimeout(interaction: discord.Interaction, feature: str, minutes: int):
-    if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message('Administrator permission required.')
+@bot.tree.command(name="dm", description="Send a DM to a user (Admin only)")
+@app_commands.checks.has_permissions(administrator=True)
+async def dm(interaction: discord.Interaction, member: discord.Member, message: str):
+    if not FEATURE_STATUS.get('dm'):
+        await interaction.response.send_message("❌ This command is currently disabled.", ephemeral=True)
         return
-    await interaction.response.defer()
-    gid = str(interaction.guild.id)
-    ensure_guild_features(interaction.guild.id)
-    if feature.lower() == 'anti_cursing':
-        features[gid]['anti_cursing_timeout_mins'] = minutes
-        save_json(FEATURE_FILE, features)
-        await interaction.followup.send(f'anti_cursing timeout set to {minutes} minutes')
-    elif feature.lower() == 'anti_spam':
-        features[gid]['anti_spam_timeout_mins'] = minutes
-        save_json(FEATURE_FILE, features)
-        await interaction.followup.send(f'anti_spam timeout set to {minutes} minutes')
-    else:
-        await interaction.followup.send('Unknown feature. Use anti_cursing or anti_spam')
 
-# Music group
-music_group = app_commands.Group(name='music', description='Music commands')
-
-@bot.tree.command(name='music', description='Music commands group - use subcommands')
-async def music_root(interaction: discord.Interaction):
-    await interaction.response.send_message('Use subcommands: play/skip/stop/queue')
-
-@bot.tree.command(name='music_play', description='Play a YouTube link in your VC')
-@app_commands.describe(url='YouTube URL')
-async def music_play(interaction: discord.Interaction, url: str):
-    # alias to music play
-    await music_play_impl(interaction, url)
-
-async def music_play_impl(interaction: discord.Interaction, url: str):
-    await interaction.response.defer()
-    if not interaction.user.voice or not interaction.user.voice.channel:
-        await interaction.followup.send('You must be in a voice channel.')
-        return
-    voice_channel = interaction.user.voice.channel
-    gid = interaction.guild.id
-    player = music_players.get(gid)
-    if not player:
-        player = MusicPlayer(gid)
-        music_players[gid] = player
     try:
-        vc = await player.connect(voice_channel)
+        embed = discord.Embed(
+            title=f"📩 Message from {interaction.guild.name}",
+            description=message,
+            color=discord.Color.blue()
+        )
+        embed.set_footer(text=f"Sent by {interaction.user.display_name}")
+        await member.send(embed=embed)
+        await interaction.response.send_message(f"✅ DM sent to {member.mention}.", ephemeral=True)
+    except discord.Forbidden:
+        await interaction.response.send_message(f"❌ Cannot send DM to {member.mention}. They may have DMs disabled.", ephemeral=True)
     except Exception as e:
-        await interaction.followup.send('Could not connect to VC: ' + str(e))
-        return
-    # create ffmpeg source via yt-dlp
-    try:
-        source = await create_ffmpeg_source(url)
-    except Exception as e:
-        await interaction.followup.send('Could not extract audio: ' + str(e))
-        return
-    await player.add_song(source)
-    await interaction.followup.send('Added to queue.')
+        await interaction.response.send_message(f"❌ Failed to send DM: {e}", ephemeral=True)
 
-@bot.tree.command(name='music_skip', description='Skip current song')
-async def music_skip(interaction: discord.Interaction):
-    gid = interaction.guild.id
-    player = music_players.get(gid)
-    if not player or not player.voice_client:
-        await interaction.response.send_message('Nothing playing.')
+@bot.tree.command(name="dmeveryone", description="Send a DM to all server members (Admin only)")
+@app_commands.checks.has_permissions(administrator=True)
+async def dmeveryone(interaction: discord.Interaction, message: str):
+    await interaction.response.defer(ephemeral=True)
+    
+    guild = interaction.guild
+    members = [m for m in guild.members if not m.bot]
+    
+    if not members:
+        await interaction.followup.send("❌ No members to send DMs to.", ephemeral=True)
         return
-    # stop current playback to move to next
-    player.voice_client.stop()
-    await interaction.response.send_message('Skipped current track.')
-
-@bot.tree.command(name='music_stop', description='Stop playback and clear queue')
-async def music_stop(interaction: discord.Interaction):
-    gid = interaction.guild.id
-    player = music_players.get(gid)
-    if not player:
-        await interaction.response.send_message('Nothing to stop.')
-        return
-    player.stopped = True
-    # cancel queue
-    while not player.queue.empty():
+    
+    embed = discord.Embed(
+        title=f"📢 Announcement from {guild.name}",
+        description=message,
+        color=discord.Color.purple()
+    )
+    embed.set_footer(text=f"Sent by {interaction.user.display_name}")
+    
+    success_count = 0
+    failed_count = 0
+    
+    status_embed = discord.Embed(
+        title="📨 Sending DMs...",
+        description=f"Sending to {len(members)} members...",
+        color=discord.Color.blue()
+    )
+    await interaction.followup.send(embed=status_embed, ephemeral=True)
+    
+    for member in members:
         try:
-            player.queue.get_nowait()
-        except Exception:
-            break
-    if player.voice_client and player.voice_client.is_connected():
-        player.voice_client.stop()
-        await player.voice_client.disconnect()
-    music_players.pop(gid, None)
-    await interaction.response.send_message('Stopped playback and cleared queue.')
+            await member.send(embed=embed)
+            success_count += 1
+        except discord.Forbidden:
+            failed_count += 1
+        except Exception as e:
+            print(f"Error sending DM to {member}: {e}")
+            failed_count += 1
+        finally:
+            await asyncio.sleep(0.5)
+    
+    result_embed = discord.Embed(
+        title="✅ DM Broadcast Complete",
+        description=f"**Sent:** {success_count}\n**Failed:** {failed_count}",
+        color=discord.Color.green()
+    )
+    await interaction.edit_original_response(embed=result_embed)
 
-@bot.tree.command(name='music_queue', description='Show queue length')
-async def music_queue(interaction: discord.Interaction):
-    gid = interaction.guild.id
-    player = music_players.get(gid)
-    if not player:
-        await interaction.response.send_message('Queue is empty.')
-        return
-    qsize = player.queue.qsize()
-    await interaction.response.send_message(f'Queue size: {qsize}')
+@bot.tree.command(name="ticketpanel", description="Create a ticket panel (Admin only)")
+@app_commands.checks.has_permissions(administrator=True)
+async def ticketpanel(interaction: discord.Interaction):
+    embed = discord.Embed(
+        title="🎫 Support Ticket System",
+        description="Need help? Click the button below to create a support ticket!\n\n"
+                    "**How it works:**\n"
+                    "• Click the 'Create Ticket' button\n"
+                    "• A private channel will be created for you\n"
+                    "• Only you and admins can see your ticket\n"
+                    "• Staff will assist you as soon as possible",
+        color=discord.Color.blue()
+    )
+    embed.set_footer(text="Tickets are private and only visible to you and staff")
+    
+    view = TicketPanelView()
+    await interaction.channel.send(embed=embed, view=view)
+    await interaction.response.send_message("✅ Ticket panel created!", ephemeral=True)
 
-# Run the bot
-if __name__ == '__main__':
-    if not TOKEN:
-        print('DISCORD_TOKEN missing in .env')
+@bot.tree.command(name="closeticket", description="Close a ticket channel (Admin only)")
+@app_commands.checks.has_permissions(administrator=True)
+async def closeticket(interaction: discord.Interaction):
+    channel = interaction.channel
+    guild_id = interaction.guild.id
+    
+    if guild_id in active_tickets and channel.id in active_tickets[guild_id]:
+        embed = discord.Embed(
+            title="🔒 Closing Ticket",
+            description="This ticket will be deleted in 5 seconds...",
+            color=discord.Color.red()
+        )
+        embed.set_footer(text=f"Closed by {interaction.user.display_name}")
+        
+        await interaction.response.send_message(embed=embed)
+        
+        active_tickets[guild_id].remove(channel.id)
+        if channel.id in ticket_claims:
+            del ticket_claims[channel.id]
+        save_data()
+        
+        await asyncio.sleep(5)
+        await channel.delete(reason=f"Ticket closed by {interaction.user.display_name}")
     else:
-        bot.run(TOKEN)
+        await interaction.response.send_message("❌ This is not an active ticket channel.", ephemeral=True)
+
+@bot.tree.command(name="addsupportrole", description="Add a role that can manage tickets (Admin only)")
+@app_commands.checks.has_permissions(administrator=True)
+async def addsupportrole(interaction: discord.Interaction, role: discord.Role):
+    guild_id = interaction.guild.id
+    
+    if guild_id not in support_roles:
+        support_roles[guild_id] = []
+    
+    if role.id in support_roles[guild_id]:
+        await interaction.response.send_message(f"❌ {role.mention} is already a support role.", ephemeral=True)
+        return
+    
+    support_roles[guild_id].append(role.id)
+    save_data()
+    
+    embed = discord.Embed(
+        title="✅ Support Role Added",
+        description=f"{role.mention} can now manage tickets!",
+        color=discord.Color.green()
+    )
+    await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name="removesupportrole", description="Remove a support role (Admin only)")
+@app_commands.checks.has_permissions(administrator=True)
+async def removesupportrole(interaction: discord.Interaction, role: discord.Role):
+    guild_id = interaction.guild.id
+    
+    if guild_id not in support_roles or role.id not in support_roles[guild_id]:
+        await interaction.response.send_message(f"❌ {role.mention} is not a support role.", ephemeral=True)
+        return
+    
+    support_roles[guild_id].remove(role.id)
+    save_data()
+    
+    embed = discord.Embed(
+        title="✅ Support Role Removed",
+        description=f"{role.mention} can no longer manage tickets.",
+        color=discord.Color.orange()
+    )
+    await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name="listsupportroles", description="List all support roles (Admin only)")
+@app_commands.checks.has_permissions(administrator=True)
+async def listsupportroles(interaction: discord.Interaction):
+    guild_id = interaction.guild.id
+    
+    if guild_id not in support_roles or not support_roles[guild_id]:
+        await interaction.response.send_message("❌ No support roles configured.", ephemeral=True)
+        return
+    
+    embed = discord.Embed(
+        title="🎫 Support Roles",
+        description="The following roles can manage tickets:",
+        color=discord.Color.blue()
+    )
+    
+    roles_list = []
+    for role_id in support_roles[guild_id]:
+        role = interaction.guild.get_role(role_id)
+        if role:
+            roles_list.append(role.mention)
+    
+    if roles_list:
+        embed.add_field(name="Roles", value="\n".join(roles_list), inline=False)
+    else:
+        embed.add_field(name="Roles", value="None (all roles have been deleted)", inline=False)
+    
+    await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name="sync", description="Sync slash commands to this server (Admin only)")
+@app_commands.checks.has_permissions(administrator=True)
+async def sync(interaction: discord.Interaction):
+    try:
+        await interaction.response.defer(ephemeral=True)
+        
+        synced = await bot.tree.sync(guild=interaction.guild)
+        
+        embed = discord.Embed(
+            title="✅ Commands Synced",
+            description=f"Successfully synced {len(synced)} commands to this server!\n\nAll slash commands should now be visible immediately.",
+            color=discord.Color.green()
+        )
+        embed.set_footer(text=f"Synced by {interaction.user.display_name}")
+        await interaction.followup.send(embed=embed, ephemeral=True)
+    except Exception as e:
+        await interaction.followup.send(f"❌ Failed to sync commands: {e}", ephemeral=True)
+
+class MusicQueue:
+    def __init__(self):
+        self.queue = []
+        self.current = None
+        self.voice_client = None
+    
+    def add_song(self, song):
+        self.queue.append(song)
+    
+    def next_song(self):
+        if self.queue:
+            self.current = self.queue.pop(0)
+            return self.current
+        self.current = None
+        return None
+    
+    def clear(self):
+        self.queue = []
+        self.current = None
+
+guild_music_queues = {}
+
+def get_music_queue(guild_id):
+    if guild_id not in guild_music_queues:
+        guild_music_queues[guild_id] = MusicQueue()
+    return guild_music_queues[guild_id]
+
+@bot.tree.command(name="music", description="Play music from a YouTube URL")
+async def music(interaction: discord.Interaction, url: str):
+    if not interaction.user.voice:
+        await interaction.response.send_message("❌ You must be in a voice channel to use this command!", ephemeral=True)
+        return
+    
+    await interaction.response.defer()
+    
+    guild_id = interaction.guild.id
+    music_queue = get_music_queue(guild_id)
+    
+    if not music_queue.voice_client or not music_queue.voice_client.is_connected():
+        try:
+            music_queue.voice_client = await interaction.user.voice.channel.connect()
+        except Exception as e:
+            await interaction.followup.send(f"❌ Failed to connect to voice channel: {e}")
+            return
+    
+    try:
+        import yt_dlp
+        
+        ydl_opts = {
+            'format': 'bestaudio/best',
+            'postprocessors': [{
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': 'mp3',
+                'preferredquality': '192',
+            }],
+            'quiet': True,
+            'no_warnings': True,
+            'extract_flat': False,
+        }
+        
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            song = {
+                'url': info['url'],
+                'title': info.get('title', 'Unknown'),
+                'duration': info.get('duration', 0),
+                'requested_by': interaction.user.id
+            }
+        
+        music_queue.add_song(song)
+        
+        if not music_queue.voice_client.is_playing():
+            await play_next_song(interaction.guild, music_queue)
+            embed = discord.Embed(
+                title="🎵 Now Playing",
+                description=f"**{song['title']}**",
+                color=discord.Color.green()
+            )
+            embed.set_footer(text=f"Requested by {interaction.user.display_name}")
+            await interaction.followup.send(embed=embed)
+        else:
+            embed = discord.Embed(
+                title="➕ Added to Queue",
+                description=f"**{song['title']}**\nPosition: {len(music_queue.queue)}",
+                color=discord.Color.blue()
+            )
+            embed.set_footer(text=f"Requested by {interaction.user.display_name}")
+            await interaction.followup.send(embed=embed)
+    
+    except Exception as e:
+        await interaction.followup.send(f"❌ Failed to load song: {e}")
+
+async def play_next_song(guild, music_queue):
+    song = music_queue.next_song()
+    
+    if song is None:
+        return
+    
+    ffmpeg_options = {
+        'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
+        'options': '-vn'
+    }
+    
+    def after_playing(error):
+        if error:
+            print(f"Error in playback: {error}")
+        
+        asyncio.run_coroutine_threadsafe(
+            play_next_song(guild, music_queue),
+            bot.loop
+        )
+    
+    try:
+        music_queue.voice_client.play(
+            discord.FFmpegPCMAudio(song['url'], **ffmpeg_options),
+            after=after_playing
+        )
+    except Exception as e:
+        print(f"Error playing song: {e}")
+
+@bot.tree.command(name="musicstop", description="Stop music playback and clear the queue")
+@app_commands.checks.has_permissions(administrator=True)
+async def musicstop(interaction: discord.Interaction):
+    guild_id = interaction.guild.id
+    music_queue = get_music_queue(guild_id)
+    
+    if not music_queue.voice_client or not music_queue.voice_client.is_connected():
+        await interaction.response.send_message("❌ Bot is not in a voice channel!", ephemeral=True)
+        return
+    
+    music_queue.clear()
+    music_queue.voice_client.stop()
+    await music_queue.voice_client.disconnect()
+    music_queue.voice_client = None
+    
+    embed = discord.Embed(
+        title="⏹️ Music Stopped",
+        description="Playback stopped and queue cleared. Bot disconnected from voice channel.",
+        color=discord.Color.red()
+    )
+    await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name="musicqueue", description="Show the current music queue")
+async def musicqueue(interaction: discord.Interaction):
+    guild_id = interaction.guild.id
+    music_queue = get_music_queue(guild_id)
+    
+    if not music_queue.current and not music_queue.queue:
+        await interaction.response.send_message("❌ The music queue is empty!", ephemeral=True)
+        return
+    
+    embed = discord.Embed(
+        title="🎵 Music Queue",
+        color=discord.Color.purple()
+    )
+    
+    if music_queue.current:
+        requester = interaction.guild.get_member(music_queue.current['requested_by'])
+        requester_name = requester.display_name if requester else "Unknown"
+        embed.add_field(
+            name="🎵 Now Playing",
+            value=f"**{music_queue.current['title']}**\nRequested by: {requester_name}",
+            inline=False
+        )
+    
+    if music_queue.queue:
+        queue_text = ""
+        for i, song in enumerate(music_queue.queue[:10], 1):
+            requester = interaction.guild.get_member(song['requested_by'])
+            requester_name = requester.display_name if requester else "Unknown"
+            queue_text += f"{i}. **{song['title']}**\n   Requested by: {requester_name}\n"
+        
+        if len(music_queue.queue) > 10:
+            queue_text += f"\n... and {len(music_queue.queue) - 10} more songs"
+        
+        embed.add_field(
+            name="📜 Up Next",
+            value=queue_text,
+            inline=False
+        )
+    
+    await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name="musicskip", description="Skip the current song")
+async def musicskip(interaction: discord.Interaction):
+    guild_id = interaction.guild.id
+    music_queue = get_music_queue(guild_id)
+    
+    if not music_queue.voice_client or not music_queue.voice_client.is_playing():
+        await interaction.response.send_message("❌ Nothing is currently playing!", ephemeral=True)
+        return
+    
+    skipped_song = music_queue.current['title'] if music_queue.current else "Unknown"
+    music_queue.voice_client.stop()
+    
+    embed = discord.Embed(
+        title="⏭️ Song Skipped",
+        description=f"Skipped: **{skipped_song}**",
+        color=discord.Color.orange()
+    )
+    embed.set_footer(text=f"Skipped by {interaction.user.display_name}")
+    await interaction.response.send_message(embed=embed)
+
+DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
+
+if not DISCORD_TOKEN:
+    print("❌ Error: DISCORD_TOKEN not found in environment variables.")
+    print("Please set your Discord bot token in the .env file or secrets.")
+    exit(1)
+
+bot.run(DISCORD_TOKEN)
