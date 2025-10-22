@@ -4,35 +4,17 @@ from discord.ext import commands
 import os
 import datetime
 import asyncio
-import json
 from dotenv import load_dotenv
 
-# Install ffmpeg for Railway or Linux hosts
-os.system("apt-get update && apt-get install -y ffmpeg > /dev/null 2>&1")
+# === Ensure ffmpeg is available ===
+os.system("apt update && apt install -y ffmpeg > /dev/null 2>&1 || true")
 
 # === Load environment variables ===
 load_dotenv()
 
 # === Configuration ===
 DEFAULT_VERIFY_ROLE_NAME = "🧑︱Member"
-COMMANDS_DATA_FILE = "commands_data.json"
-TICKETS_DATA_FILE = "tickets_data.json"
-TICKET_CATEGORY_NAME = "Tickets"
-SUPPORT_ROLES_FILE = "support_roles.json"
-VERIFY_ROLES_FILE = "verify_roles.json"
-
-FEATURE_STATUS = {
-    'info': True,
-    'kick': True,
-    'ban': True,
-    'timeout': True,
-    'cursing': True,
-    'spamming': True,
-    'dm': True,
-    'warn': True
-}
-
-BAD_WORDS = ["fuck", "shit", "bitch", "asshole"]  # shortened for brevity
+BAD_WORDS = ["fuck", "shit", "bitch", "asshole"]
 
 SPAM_THRESHOLD = 5
 SPAM_COOLDOWN = 6
@@ -45,7 +27,7 @@ intents.message_content = True
 intents.members = True
 intents.voice_states = True
 
-# === Bot Class ===
+# === Bot Setup ===
 class MyBot(commands.Bot):
     def __init__(self):
         super().__init__(command_prefix="!", intents=intents)
@@ -56,7 +38,7 @@ class MyBot(commands.Bot):
 
 bot = MyBot()
 
-# === MUSIC SYSTEM ===
+# === MUSIC QUEUE SYSTEM ===
 class MusicQueue:
     def __init__(self):
         self.queue = []
@@ -73,7 +55,9 @@ class MusicQueue:
         self.current = None
         return None
 
+
 guild_music_queues = {}
+
 
 def get_music_queue(guild_id):
     if guild_id not in guild_music_queues:
@@ -96,13 +80,18 @@ async def music(interaction: discord.Interaction, url: str):
     if not music_queue.voice_client or not music_queue.voice_client.is_connected():
         try:
             music_queue.voice_client = await interaction.user.voice.channel.connect()
+            print(f"[{interaction.guild.name}] Connected to voice channel.")
         except Exception as e:
             await interaction.followup.send(f"❌ Failed to connect to voice channel: {e}")
             return
 
     import yt_dlp
     try:
-        ydl_opts = {'format': 'bestaudio', 'quiet': True, 'noplaylist': True}
+        ydl_opts = {
+            'format': 'bestaudio[ext=m4a]/bestaudio/best',
+            'quiet': True,
+            'noplaylist': True
+        }
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
             title = info.get('title', 'Unknown')
@@ -115,6 +104,7 @@ async def music(interaction: discord.Interaction, url: str):
             embed = discord.Embed(title="🎵 Now Playing", description=f"**{title}**", color=discord.Color.green())
         else:
             embed = discord.Embed(title="➕ Added to Queue", description=f"**{title}** (#{len(music_queue.queue)})", color=discord.Color.blue())
+
         embed.set_footer(text=f"Requested by {interaction.user.display_name}")
         await interaction.followup.send(embed=embed)
     except Exception as e:
@@ -124,21 +114,25 @@ async def music(interaction: discord.Interaction, url: str):
 async def play_next_song(guild, music_queue):
     song = music_queue.next_song()
     if not song:
-        print(f"[{guild.name}] Queue empty — leaving voice channel.")
-        if music_queue.voice_client and music_queue.voice_client.is_connected():
-            await music_queue.voice_client.disconnect()
+        print(f"[{guild.name}] Queue empty — waiting instead of disconnecting.")
         return
 
     print(f"[{guild.name}] Loading: {song['title']}")
 
     try:
         import yt_dlp
-        ydl_opts = {'format': 'bestaudio/best', 'quiet': True, 'noplaylist': True}
+        ydl_opts = {
+            'format': 'bestaudio[ext=m4a]/bestaudio/best',
+            'quiet': True,
+            'noplaylist': True
+        }
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(song['url'], download=False)
             stream_url = info['url']
 
-        ffmpeg_exe = "ffmpeg"
+        print(f"[DEBUG] Streaming URL: {stream_url[:100]}...")
+        print(f"[DEBUG] Using FFmpeg executable: ffmpeg")
+
         ffmpeg_options = {
             'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
             'options': '-vn'
@@ -151,16 +145,15 @@ async def play_next_song(guild, music_queue):
                 print(f"[{guild.name}] Finished: {song['title']}")
             asyncio.run_coroutine_threadsafe(play_next_song(guild, music_queue), bot.loop)
 
-        music_queue.voice_client.play(
-            discord.FFmpegPCMAudio(stream_url, executable=ffmpeg_exe, **ffmpeg_options),
-            after=after_playing
-        )
-
+        # Play the song
+        source = discord.FFmpegPCMAudio(stream_url, executable="ffmpeg", **ffmpeg_options)
+        music_queue.voice_client.play(source, after=after_playing)
         music_queue.current = song
         print(f"[{guild.name}] Now playing: {song['title']}")
 
     except Exception as e:
         print(f"[{guild.name}] ❌ Error playing {song['title']}: {e}")
+        # Skip the broken song and continue
         await play_next_song(guild, music_queue)
 
 
@@ -175,7 +168,11 @@ async def musicskip(interaction: discord.Interaction):
 
     skipped = music_queue.current['title'] if music_queue.current else 'Unknown'
     music_queue.voice_client.stop()
-    await interaction.response.send_message(embed=discord.Embed(title="⏭️ Skipped", description=f"**{skipped}**", color=discord.Color.orange()))
+    await interaction.response.send_message(embed=discord.Embed(
+        title="⏭️ Skipped",
+        description=f"**{skipped}**",
+        color=discord.Color.orange()
+    ))
 
 
 @bot.tree.command(name="musicstop", description="Stop music and clear the queue")
@@ -191,10 +188,13 @@ async def musicstop(interaction: discord.Interaction):
     music_queue.voice_client.stop()
     await music_queue.voice_client.disconnect()
     music_queue.queue.clear()
-    await interaction.response.send_message(embed=discord.Embed(title="⏹️ Stopped", description="Music stopped and bot disconnected.", color=discord.Color.red()))
+    await interaction.response.send_message(embed=discord.Embed(
+        title="⏹️ Stopped",
+        description="Music stopped and bot disconnected.",
+        color=discord.Color.red()
+    ))
 
 
-# === OPTIONAL: Volume Command ===
 @bot.tree.command(name="volume", description="Change playback volume (1-100)")
 async def volume(interaction: discord.Interaction, percent: int):
     guild_id = interaction.guild.id
@@ -208,7 +208,7 @@ async def volume(interaction: discord.Interaction, percent: int):
         await interaction.response.send_message("⚠️ Please set a value between 1 and 100.", ephemeral=True)
         return
 
-    # Note: Discord.py doesn't have built-in volume, must wrap source
+    # Wrap audio in volume transformer
     music_queue.voice_client.source = discord.PCMVolumeTransformer(music_queue.voice_client.source)
     music_queue.voice_client.source.volume = percent / 100
     await interaction.response.send_message(f"🔊 Volume set to **{percent}%**")
@@ -217,7 +217,7 @@ async def volume(interaction: discord.Interaction, percent: int):
 # === BOT RUN ===
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
 if not DISCORD_TOKEN:
-    print("❌ Missing DISCORD_TOKEN in environment.")
+    print("❌ Missing DISCORD_TOKEN in environment variables.")
     exit(1)
 
 bot.run(DISCORD_TOKEN)
