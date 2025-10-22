@@ -2,6 +2,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 import os
+os.system("apt-get update && apt-get install -y ffmpeg > /dev/null 2>&1")
 import datetime
 import re
 import asyncio
