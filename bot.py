@@ -4,15 +4,11 @@ from discord.ext import commands
 import os
 import datetime
 import asyncio
+import re
 from dotenv import load_dotenv
 
-# === Ensure ffmpeg is available ===
-os.system("apt update && apt install -y ffmpeg > /dev/null 2>&1 || true")
-
-# === Load environment variables ===
 load_dotenv()
 
-# === Configuration ===
 DEFAULT_VERIFY_ROLE_NAME = "🧑︱Member"
 BAD_WORDS = ["fuck", "shit", "bitch", "asshole"]
 
@@ -21,13 +17,11 @@ SPAM_COOLDOWN = 6
 SPAM_TIMEOUT_DURATION = datetime.timedelta(minutes=10)
 CURSING_TIMEOUT_DURATION = datetime.timedelta(minutes=5)
 
-# === Discord Intents ===
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 intents.voice_states = True
 
-# === Bot Setup ===
 class MyBot(commands.Bot):
     def __init__(self):
         super().__init__(command_prefix="!", intents=intents)
@@ -38,7 +32,6 @@ class MyBot(commands.Bot):
 
 bot = MyBot()
 
-# === MUSIC QUEUE SYSTEM ===
 class MusicQueue:
     def __init__(self):
         self.queue = []
@@ -65,7 +58,49 @@ def get_music_queue(guild_id):
     return guild_music_queues[guild_id]
 
 
-# === MUSIC COMMANDS ===
+def is_valid_youtube_url(url):
+    youtube_regex = (
+        r'(https?://)?(www\.)?'
+        r'(youtube|youtu|youtube-nocookie)\.(com|be)/'
+        r'(watch\?v=|embed/|v/|.+\?v=)?([^&=%\?]{11})'
+    )
+    youtube_regex_match = re.match(youtube_regex, url)
+    return youtube_regex_match is not None
+
+
+async def extract_video_info_with_retry(url, max_retries=3):
+    import yt_dlp
+    
+    for attempt in range(max_retries):
+        try:
+            ydl_opts = {
+                'format': 'bestaudio[ext=m4a]/bestaudio/best',
+                'quiet': True,
+                'no_warnings': True,
+                'noplaylist': True,
+                'extract_flat': False,
+                'socket_timeout': 30,
+            }
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+                return info
+        except yt_dlp.utils.DownloadError as e:
+            error_msg = str(e).lower()
+            if 'unavailable' in error_msg or 'private' in error_msg or 'deleted' in error_msg:
+                raise Exception("This video is unavailable, private, or has been deleted")
+            if 'copyright' in error_msg:
+                raise Exception("This video is blocked due to copyright restrictions")
+            if attempt == max_retries - 1:
+                raise Exception(f"Failed to load video after {max_retries} attempts")
+            await asyncio.sleep(2 ** attempt)
+        except Exception as e:
+            if attempt == max_retries - 1:
+                raise
+            await asyncio.sleep(2 ** attempt)
+    
+    raise Exception("Failed to extract video information")
+
+
 @bot.tree.command(name="music", description="Play music from a YouTube URL")
 async def music(interaction: discord.Interaction, url: str):
     if not interaction.user.voice:
@@ -73,6 +108,16 @@ async def music(interaction: discord.Interaction, url: str):
         return
 
     await interaction.response.defer()
+
+    if not is_valid_youtube_url(url):
+        await interaction.followup.send(
+            "❌ Invalid URL! Please provide a valid YouTube URL.\n"
+            "Examples:\n"
+            "• https://www.youtube.com/watch?v=VIDEO_ID\n"
+            "• https://youtu.be/VIDEO_ID",
+            ephemeral=True
+        )
+        return
 
     guild_id = interaction.guild.id
     music_queue = get_music_queue(guild_id)
@@ -85,16 +130,16 @@ async def music(interaction: discord.Interaction, url: str):
             await interaction.followup.send(f"❌ Failed to connect to voice channel: {e}")
             return
 
-    import yt_dlp
     try:
-        ydl_opts = {
-            'format': 'bestaudio[ext=m4a]/bestaudio/best',
-            'quiet': True,
-            'noplaylist': True
-        }
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-            title = info.get('title', 'Unknown')
+        info = await extract_video_info_with_retry(url)
+        title = info.get('title', 'Unknown')
+        duration = info.get('duration', 0)
+        
+        if duration > 3600:
+            await interaction.followup.send(
+                "⚠️ This video is longer than 1 hour. It may cause performance issues.",
+                ephemeral=True
+            )
 
         song = {'url': url, 'title': title, 'requested_by': interaction.user.id}
         music_queue.add_song(song)
@@ -103,12 +148,21 @@ async def music(interaction: discord.Interaction, url: str):
             await play_next_song(interaction.guild, music_queue)
             embed = discord.Embed(title="🎵 Now Playing", description=f"**{title}**", color=discord.Color.green())
         else:
-            embed = discord.Embed(title="➕ Added to Queue", description=f"**{title}** (#{len(music_queue.queue)})", color=discord.Color.blue())
+            embed = discord.Embed(title="➕ Added to Queue", description=f"**{title}**\nPosition in queue: #{len(music_queue.queue)}", color=discord.Color.blue())
 
         embed.set_footer(text=f"Requested by {interaction.user.display_name}")
         await interaction.followup.send(embed=embed)
     except Exception as e:
-        await interaction.followup.send(f"❌ Failed to load: {e}")
+        error_message = str(e)
+        if "unavailable" in error_message.lower() or "private" in error_message.lower():
+            await interaction.followup.send("❌ This video is unavailable, private, or has been deleted.")
+        elif "copyright" in error_message.lower():
+            await interaction.followup.send("❌ This video is blocked due to copyright restrictions.")
+        elif "unsupported url" in error_message.lower():
+            await interaction.followup.send("❌ This URL is not supported. Please use a YouTube video link.")
+        else:
+            await interaction.followup.send(f"❌ Failed to load video: {error_message}")
+        print(f"[{interaction.guild.name}] Error loading {url}: {e}")
 
 
 async def play_next_song(guild, music_queue):
@@ -124,18 +178,19 @@ async def play_next_song(guild, music_queue):
         ydl_opts = {
             'format': 'bestaudio[ext=m4a]/bestaudio/best',
             'quiet': True,
-            'noplaylist': True
+            'no_warnings': True,
+            'noplaylist': True,
+            'socket_timeout': 30,
         }
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(song['url'], download=False)
             stream_url = info['url']
 
-        print(f"[DEBUG] Streaming URL: {stream_url[:100]}...")
-        print(f"[DEBUG] Using FFmpeg executable: ffmpeg")
+        print(f"[{guild.name}] Stream URL extracted successfully")
 
         ffmpeg_options = {
-            'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
-            'options': '-vn'
+            'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -http_persistent 0',
+            'options': '-vn -b:a 128k'
         }
 
         def after_playing(error):
@@ -145,7 +200,6 @@ async def play_next_song(guild, music_queue):
                 print(f"[{guild.name}] Finished: {song['title']}")
             asyncio.run_coroutine_threadsafe(play_next_song(guild, music_queue), bot.loop)
 
-        # Play the song
         source = discord.FFmpegPCMAudio(stream_url, executable="ffmpeg", **ffmpeg_options)
         music_queue.voice_client.play(source, after=after_playing)
         music_queue.current = song
@@ -153,7 +207,6 @@ async def play_next_song(guild, music_queue):
 
     except Exception as e:
         print(f"[{guild.name}] ❌ Error playing {song['title']}: {e}")
-        # Skip the broken song and continue
         await play_next_song(guild, music_queue)
 
 
@@ -208,13 +261,11 @@ async def volume(interaction: discord.Interaction, percent: int):
         await interaction.response.send_message("⚠️ Please set a value between 1 and 100.", ephemeral=True)
         return
 
-    # Wrap audio in volume transformer
     music_queue.voice_client.source = discord.PCMVolumeTransformer(music_queue.voice_client.source)
     music_queue.voice_client.source.volume = percent / 100
     await interaction.response.send_message(f"🔊 Volume set to **{percent}%**")
 
 
-# === BOT RUN ===
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
 if not DISCORD_TOKEN:
     print("❌ Missing DISCORD_TOKEN in environment variables.")
